@@ -1,3 +1,4 @@
+```python
 import os
 import uuid
 import telebot
@@ -20,8 +21,22 @@ ADMIN_ID = int(os.getenv("ADMIN_ID"))
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+if not TOKEN or not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("Не заданы необходимые секреты GitHub.")
+
 bot = telebot.TeleBot(TOKEN)
 db = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# =========================
+# НАСТРОЙКИ ОПЛАТЫ
+# =========================
+
+PAYMENT_NETWORK = "TRC20 (TRON)"
+
+# Это демонстрационная заглушка, НЕ адрес кошелька.
+# Для реальной оплаты сюда нужно будет вставить
+# собственный публичный адрес получения USDT.
+PAYMENT_ADDRESS = "DEMO_ONLY_REPLACE_WITH_REAL_TRON_ADDRESS"
 
 # =========================
 # ДАННЫЕ
@@ -237,7 +252,7 @@ def show_category(call):
             "Steam Gift Card\n"
             f"Цена: {PRODUCT_PRICE:g} USDT\n"
             "Регион: демонстрационный\n\n"
-            "⚠️ Тестовый товар. Оплата не подключена."
+            "⚠️ Демонстрационный товар."
         )
 
     elif call.data == "cat_games":
@@ -272,7 +287,7 @@ def back_catalog(call):
 
 
 # =========================
-# СОЗДАНИЕ ЗАКАЗА
+# СОЗДАНИЕ ЗАКАЗА И ОПЛАТА
 # =========================
 
 @bot.callback_query_handler(func=lambda c: c.data == "buy_steam")
@@ -289,7 +304,7 @@ def buy(call):
         "chat_id": call.message.chat.id,
         "product": "Steam Gift Card",
         "price": PRODUCT_PRICE,
-        "status": "Ожидает решения"
+        "status": "Ожидает оплаты"
     }
 
     save_order(order_id)
@@ -298,16 +313,22 @@ def buy(call):
         call.message.chat.id,
         f"✅ Заказ №{order_id} создан!\n\n"
         "🎁 Steam Gift Card\n"
-        f"💰 Цена: {PRODUCT_PRICE:g} USDT\n"
-        "📌 Ожидает подтверждения.\n\n"
-        "⚠️ Демонстрационный заказ. Оплата не подключена."
+        f"💰 Сумма: {PRODUCT_PRICE:g} USDT\n"
+        f"🌐 Сеть: {PAYMENT_NETWORK}\n\n"
+        "💳 Адрес для демонстрации:\n"
+        f"{PAYMENT_ADDRESS}\n\n"
+        "⚠️ ВНИМАНИЕ!\n"
+        "Это тестовая заглушка, а не настоящий адрес.\n"
+        "Не отправляйте на него криптовалюту.\n\n"
+        "После реальной оплаты администратор сможет "
+        "вручную подтвердить заказ."
     )
 
     keyboard = InlineKeyboardMarkup()
 
     keyboard.add(
         InlineKeyboardButton(
-            "✅ Подтвердить",
+            "✅ Подтвердить оплату",
             callback_data=f"approve:{order_id}"
         )
     )
@@ -325,7 +346,9 @@ def buy(call):
         f"👤 Покупатель: @{user.username or 'без username'}\n"
         f"🆔 ID: {user.id}\n"
         "🎁 Steam Gift Card\n"
-        f"💰 {PRODUCT_PRICE:g} USDT",
+        f"💰 {PRODUCT_PRICE:g} USDT\n"
+        "🌐 Сеть: TRC20\n\n"
+        "⚠️ Оплату нужно проверять вручную.",
         reply_markup=keyboard
     )
 
@@ -351,13 +374,13 @@ def manage_order(call):
 
     order = orders_db[order_id]
 
-    if order["status"] != "Ожидает решения":
+    if order["status"] != "Ожидает оплаты":
         bot.answer_callback_query(call.id, "Заказ уже обработан.")
         return
 
     if action == "approve":
-        order["status"] = "Подтверждён"
-        text = "✅ Заказ подтверждён!"
+        order["status"] = "Оплата подтверждена"
+        text = "✅ Оплата подтверждена администратором!"
     else:
         order["status"] = "Отклонён"
         text = "❌ Заказ отклонён."
@@ -542,12 +565,12 @@ def admin_stats(call):
 
     pending = sum(
         1 for o in orders_db.values()
-        if o["status"] == "Ожидает решения"
+        if o["status"] == "Ожидает оплаты"
     )
 
     approved = sum(
         1 for o in orders_db.values()
-        if o["status"] == "Подтверждён"
+        if o["status"] == "Оплата подтверждена"
     )
 
     rejected = sum(
@@ -560,8 +583,8 @@ def admin_stats(call):
         "📊 СТАТИСТИКА МАГАЗИНА\n\n"
         f"👥 Покупателей: {len(users_db)}\n"
         f"📦 Всего заказов: {total}\n"
-        f"🕒 Ожидают решения: {pending}\n"
-        f"✅ Подтверждены: {approved}\n"
+        f"🕒 Ожидают оплаты: {pending}\n"
+        f"✅ Оплата подтверждена: {approved}\n"
         f"❌ Отклонены: {rejected}\n"
         f"💬 Открытые диалоги: {len(support_users)}"
     )
@@ -803,3 +826,4 @@ load_data()
 print("Telegram bot started")
 
 bot.infinity_polling()
+```
