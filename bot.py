@@ -1,1064 +1,962 @@
 import os
 import uuid
+
 import telebot
-
+from telebot import types
 from supabase import create_client
-from telebot.types import (
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton
-)
 
-# =====================================
-# 1. ПОДКЛЮЧЕНИЕ
-# =====================================
 
-TOKEN = os.getenv("BOT_TOKEN")
+# ==================================================
+# НАСТРОЙКИ
+# ==================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_RAW = os.getenv("ADMIN_ID")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-if not TOKEN:
-    raise ValueError("Не задан BOT_TOKEN в GitHub Secrets.")
+if not BOT_TOKEN:
+    raise RuntimeError("Не задан BOT_TOKEN")
 
 if not ADMIN_ID_RAW:
-    raise ValueError("Не задан ADMIN_ID в GitHub Secrets.")
+    raise RuntimeError("Не задан ADMIN_ID")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("Не заданы SUPABASE_URL или SUPABASE_KEY.")
+    raise RuntimeError("Не заданы данные Supabase")
 
-try:
-    ADMIN_ID = int(ADMIN_ID_RAW)
-except ValueError:
-    raise ValueError("ADMIN_ID должен быть числом.")
+ADMIN_ID = int(ADMIN_ID_RAW)
 
-bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN)
 db = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-# =====================================
-# 2. НАСТРОЙКИ МАГАЗИНА
-# =====================================
+# ==================================================
+# КАТАЛОГ ТОВАРОВ
+# ==================================================
 
-PAYMENT_NETWORK = "TRC20 (TRON)"
+PRODUCTS = {
+    "steam10": {
+        "category": "gifts",
+        "name": "Steam Gift Card $10",
+        "price": 11,
+        "description": "Подарочная карта Steam на 10 долларов."
+    },
+    "steam20": {
+        "category": "gifts",
+        "name": "Steam Gift Card $20",
+        "price": 21,
+        "description": "Подарочная карта Steam на 20 долларов."
+    },
+    "steam50": {
+        "category": "gifts",
+        "name": "Steam Gift Card $50",
+        "price": 52,
+        "description": "Подарочная карта Steam на 50 долларов."
+    },
+    "steam100": {
+        "category": "gifts",
+        "name": "Steam Gift Card $100",
+        "price": 103,
+        "description": "Подарочная карта Steam на 100 долларов."
+    },
 
-# ДЕМОНСТРАЦИОННАЯ ЗАГЛУШКА.
-# Это НЕ настоящий адрес криптокошелька.
-# Не принимай на него платежи.
-PAYMENT_ADDRESS = "DEMO_ONLY_REPLACE_WITH_REAL_TRON_ADDRESS"
+    "terraria": {
+        "category": "games",
+        "name": "Terraria",
+        "price": 9,
+        "description": "Цифровой ключ игры Terraria."
+    },
+    "stardew": {
+        "category": "games",
+        "name": "Stardew Valley",
+        "price": 11,
+        "description": "Цифровой ключ игры Stardew Valley."
+    },
+    "portal2": {
+        "category": "games",
+        "name": "Portal 2",
+        "price": 5,
+        "description": "Цифровой ключ игры Portal 2."
+    },
+    "hollow": {
+        "category": "games",
+        "name": "Hollow Knight",
+        "price": 9,
+        "description": "Цифровой ключ игры Hollow Knight."
+    },
+    "celeste": {
+        "category": "games",
+        "name": "Celeste",
+        "price": 8,
+        "description": "Цифровой ключ игры Celeste."
+    },
 
-PRODUCT_PRICE = 10.0
-
-orders_db = {}
-users_db = {}
-support_users = set()
-
-active_admin_chat = None
-waiting_price = False
-
-
-# =====================================
-# 3. ЗАГРУЗКА ДАННЫХ ИЗ SUPABASE
-# =====================================
-
-def load_data():
-    global PRODUCT_PRICE
-
-    print("Загружаю данные из Supabase...")
-
-    # Покупатели
-    users = db.table("users").select("*").execute().data
-
-    for user in users:
-        user_id = int(user["user_id"])
-
-        users_db[user_id] = {
-            "username": user.get("username") or "без username",
-            "first_name": user.get("first_name") or "Покупатель"
-        }
-
-    # Заказы
-    orders = db.table("orders").select("*").execute().data
-
-    for order in orders:
-        order_id = str(order["order_id"])
-        user_id = int(order["user_id"])
-
-        orders_db[order_id] = {
-            "user_id": user_id,
-            "chat_id": user_id,
-            "product": order["product"],
-            "price": float(order["price"]),
-            "status": order["status"]
-        }
-
-    # Открытые диалоги поддержки
-    chats = (
-        db.table("support_chats")
-        .select("*")
-        .eq("is_open", True)
-        .execute()
-        .data
-    )
-
-    for chat in chats:
-        support_users.add(int(chat["user_id"]))
-
-    # Цена товара
-    settings = (
-        db.table("shop_settings")
-        .select("*")
-        .eq("setting_name", "product_price")
-        .execute()
-        .data
-    )
-
-    if settings:
-        PRODUCT_PRICE = float(settings[0]["setting_value"])
-
-    print("Данные успешно загружены.")
-    print("Покупателей:", len(users_db))
-    print("Заказов:", len(orders_db))
+    "pcpass": {
+        "category": "subs",
+        "name": "PC Game Pass — 1 месяц",
+        "price": 12,
+        "description": "Подписка PC Game Pass на один месяц."
+    },
+    "xboxpass": {
+        "category": "subs",
+        "name": "Xbox Game Pass Ultimate — 1 месяц",
+        "price": 18,
+        "description": "Подписка Xbox Game Pass Ultimate на один месяц."
+    },
+    "nitro": {
+        "category": "subs",
+        "name": "Discord Nitro — 1 месяц",
+        "price": 10,
+        "description": "Подарочный код Discord Nitro на один месяц."
+    }
+}
 
 
-# =====================================
-# 4. СОХРАНЕНИЕ ДАННЫХ
-# =====================================
+CATEGORIES = {
+    "gifts": "🎁 Подарочные карты",
+    "games": "🎮 Игры",
+    "subs": "⭐ Подписки"
+}
+
+
+# Адрес оставлен пустым специально.
+# Не указывай случайный или непроверенный адрес кошелька.
+USDT_ADDRESS = ""
+
+
+# ==================================================
+# РАБОТА С БАЗОЙ ДАННЫХ
+# ==================================================
 
 def save_user(user):
-    users_db[user.id] = {
-        "username": user.username or "без username",
-        "first_name": user.first_name or "Покупатель"
-    }
+    try:
+        data = {
+            "user_id": user.id,
+            "username": user.username or "",
+            "first_name": user.first_name or "",
+            "last_name": user.last_name or ""
+        }
 
-    db.table("users").upsert({
-        "user_id": user.id,
-        "username": user.username or "без username",
-        "first_name": user.first_name or "Покупатель"
-    }).execute()
+        existing = (
+            db.table("users")
+            .select("user_id")
+            .eq("user_id", user.id)
+            .execute()
+            .data
+        )
 
+        if existing:
+            db.table("users").update(data).eq(
+                "user_id", user.id
+            ).execute()
+        else:
+            db.table("users").insert(data).execute()
 
-def save_order(order_id):
-    order = orders_db[order_id]
-
-    db.table("orders").upsert({
-        "order_id": order_id,
-        "user_id": order["user_id"],
-        "product": order["product"],
-        "price": order["price"],
-        "status": order["status"]
-    }).execute()
-
-
-def save_message(user_id, sender, message):
-    db.table("support_messages").insert({
-        "user_id": user_id,
-        "sender": sender,
-        "message": message
-    }).execute()
+    except Exception as error:
+        print("Ошибка сохранения пользователя:", error)
 
 
-def save_chat(user_id, is_open):
-    db.table("support_chats").upsert({
-        "user_id": user_id,
-        "is_open": is_open
-    }).execute()
+def save_order(order_id, user_id, product, price, status):
+    try:
+        data = {
+            "order_id": order_id,
+            "user_id": user_id,
+            "product": product,
+            "price": float(price),
+            "status": status
+        }
+
+        db.table("orders").insert(data).execute()
+        return True
+
+    except Exception as error:
+        print("Ошибка сохранения заказа:", error)
+        return False
 
 
-# =====================================
-# 5. ГЛАВНОЕ МЕНЮ
-# =====================================
+def update_order(order_id, status):
+    try:
+        db.table("orders").update({
+            "status": status
+        }).eq("order_id", order_id).execute()
+
+    except Exception as error:
+        print("Ошибка обновления заказа:", error)
+
+
+# ==================================================
+# КЛАВИАТУРЫ
+# ==================================================
+
+def main_menu(user_id):
+    keyboard = types.ReplyKeyboardMarkup(
+        resize_keyboard=True
+    )
+
+    keyboard.row("🛍 Каталог", "📦 Мои заказы")
+    keyboard.row("💬 Поддержка")
+
+    if user_id == ADMIN_ID:
+        keyboard.row("⚙️ Админ-панель")
+
+    return keyboard
+
+
+def catalog_keyboard():
+    keyboard = types.InlineKeyboardMarkup()
+
+    for category_id, category_name in CATEGORIES.items():
+        keyboard.add(
+            types.InlineKeyboardButton(
+                category_name,
+                callback_data=f"cat_{category_id}"
+            )
+        )
+
+    return keyboard
+
+
+def products_keyboard(category):
+    keyboard = types.InlineKeyboardMarkup()
+
+    for product_id, product in PRODUCTS.items():
+
+        if product["category"] == category:
+
+            keyboard.add(
+                types.InlineKeyboardButton(
+                    f'{product["name"]} — {product["price"]} USDT',
+                    callback_data=f"product:{product_id}"
+                )
+            )
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "⬅️ Назад",
+            callback_data="catalog"
+        )
+    )
+
+    return keyboard
+
+
+def product_keyboard(product_id, category):
+    keyboard = types.InlineKeyboardMarkup()
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "🛒 Купить",
+            callback_data=f"buy:{product_id}"
+        )
+    )
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "⬅️ Назад",
+            callback_data=f"cat_{category}"
+        )
+    )
+
+    return keyboard
+
+
+# ==================================================
+# СТАРТ
+# ==================================================
 
 @bot.message_handler(commands=["start"])
 def start(message):
-    try:
-        save_user(message.from_user)
 
-        menu = ReplyKeyboardMarkup(resize_keyboard=True)
+    save_user(message.from_user)
 
-        menu.add(KeyboardButton("🛒 Каталог"))
-        menu.add(KeyboardButton("📦 Мои заказы"))
-        menu.add(KeyboardButton("💬 Поддержка"))
-
-        bot.send_message(
-            message.chat.id,
-            "🛍 Добро пожаловать в Steam Digital Shop!\n\n"
-            "Выберите раздел:",
-            reply_markup=menu
-        )
-
-    except Exception as error:
-        print("Ошибка start:", error)
-        bot.send_message(
-            message.chat.id,
-            "Произошла ошибка. Попробуйте позже."
-        )
+    bot.send_message(
+        message.chat.id,
+        "👋 Добро пожаловать в <b>Digital Shop</b>!\n\n"
+        "Здесь ты можешь выбрать цифровые товары "
+        "и оформить заказ.\n\n"
+        "Нажми «Каталог», чтобы посмотреть ассортимент.",
+        parse_mode="HTML",
+        reply_markup=main_menu(message.from_user.id)
+    )
 
 
-# =====================================
-# 6. АДМИН-ПАНЕЛЬ
-# =====================================
+# ==================================================
+# КАТАЛОГ
+# ==================================================
 
-def admin_keyboard():
-    keyboard = InlineKeyboardMarkup()
+@bot.message_handler(func=lambda m: m.text == "🛍 Каталог")
+def open_catalog(message):
 
-    buttons = [
-        ("📋 Заказы", "admin_orders"),
-        ("👥 Покупатели", "admin_users"),
-        ("💬 Диалоги", "admin_chats"),
-        ("📊 Статистика", "admin_stats"),
-        ("⚙️ Товары и цены", "admin_products")
-    ]
-
-    for title, data in buttons:
-        keyboard.add(
-            InlineKeyboardButton(
-                title,
-                callback_data=data
-            )
-        )
-
-    return keyboard
+    bot.send_message(
+        message.chat.id,
+        "🛍 <b>Каталог товаров</b>\n\n"
+        "Выбери категорию:",
+        parse_mode="HTML",
+        reply_markup=catalog_keyboard()
+    )
 
 
-@bot.message_handler(commands=["admin"])
-def admin_panel(message):
-    if message.from_user.id != ADMIN_ID:
-        bot.send_message(
-            message.chat.id,
-            "⛔ Нет доступа."
-        )
+@bot.callback_query_handler(
+    func=lambda call: call.data == "catalog"
+)
+def back_to_catalog(call):
+
+    bot.answer_callback_query(call.id)
+
+    bot.edit_message_text(
+        "🛍 <b>Каталог товаров</b>\n\nВыбери категорию:",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="HTML",
+        reply_markup=catalog_keyboard()
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("cat_")
+)
+def open_category(call):
+
+    bot.answer_callback_query(call.id)
+
+    category = call.data.replace("cat_", "")
+
+    if category not in CATEGORIES:
         return
 
-    bot.send_message(
-        message.chat.id,
-        "⚙️ АДМИНИСТРАТИВНАЯ ПАНЕЛЬ\n\n"
-        "Выберите нужный раздел:",
-        reply_markup=admin_keyboard()
-    )
-
-
-# =====================================
-# 7. КАТАЛОГ
-# =====================================
-
-def catalog_keyboard():
-    keyboard = InlineKeyboardMarkup()
-
-    keyboard.add(
-        InlineKeyboardButton(
-            "🎁 Подарочные карты",
-            callback_data="cat_gifts"
-        )
-    )
-
-    keyboard.add(
-        InlineKeyboardButton(
-            "🎮 Ключи игр",
-            callback_data="cat_games"
-        )
-    )
-
-    keyboard.add(
-        InlineKeyboardButton(
-            "⭐ Подписки",
-            callback_data="cat_subs"
-        )
-    )
-
-    return keyboard
-
-
-@bot.message_handler(func=lambda m: m.text == "🛒 Каталог")
-def catalog(message):
-    bot.send_message(
-        message.chat.id,
-        "🛍 КАТАЛОГ МАГАЗИНА\n\n"
-        "Выберите категорию:",
-        reply_markup=catalog_keyboard()
+    bot.edit_message_text(
+        f"<b>{CATEGORIES[category]}</b>\n\n"
+        "Выбери товар:",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="HTML",
+        reply_markup=products_keyboard(category)
     )
 
 
 @bot.callback_query_handler(
-    func=lambda c: c.data.startswith("cat_")
+    func=lambda call: call.data.startswith("product:")
 )
-def show_category(call):
+def open_product(call):
+
     bot.answer_callback_query(call.id)
 
-    keyboard = InlineKeyboardMarkup()
+    product_id = call.data.split(":", 1)[1]
+    product = PRODUCTS.get(product_id)
 
-    if call.data == "cat_gifts":
+    if not product:
+        return
 
-        keyboard.add(
-            InlineKeyboardButton(
-                f"🎁 Steam Gift Card — {PRODUCT_PRICE:g} USDT",
-                callback_data="buy_steam"
-            )
-        )
-
-        text = (
-            "🎁 ПОДАРОЧНЫЕ КАРТЫ\n\n"
-            "Steam Gift Card\n"
-            f"Цена: {PRODUCT_PRICE:g} USDT\n"
-            "Регион: демонстрационный\n\n"
-            "⚠️ Демонстрационный товар."
-        )
-
-    elif call.data == "cat_games":
-
-        text = (
-            "🎮 КЛЮЧИ ИГР\n\n"
-            "Пока товаров нет."
-        )
-
-    else:
-
-        text = (
-            "⭐ ПОДПИСКИ\n\n"
-            "Пока товаров нет."
-        )
-
-    keyboard.add(
-        InlineKeyboardButton(
-            "⬅️ Назад",
-            callback_data="back_catalog"
-        )
+    text = (
+        f"🛍 <b>{product['name']}</b>\n\n"
+        f"{product['description']}\n\n"
+        f"💰 Цена: <b>{product['price']} USDT</b>\n\n"
+        "ℹ️ Демонстрационная карточка товара. "
+        "Перед реальной продажей проверь наличие, регион "
+        "и условия активации кода."
     )
 
-    bot.send_message(
-        call.message.chat.id,
+    bot.edit_message_text(
         text,
-        reply_markup=keyboard
-    )
-
-
-@bot.callback_query_handler(
-    func=lambda c: c.data == "back_catalog"
-)
-def back_catalog(call):
-    bot.answer_callback_query(call.id)
-
-    bot.send_message(
         call.message.chat.id,
-        "🛍 ВЫБЕРИТЕ КАТЕГОРИЮ:",
-        reply_markup=catalog_keyboard()
+        call.message.message_id,
+        parse_mode="HTML",
+        reply_markup=product_keyboard(
+            product_id,
+            product["category"]
+        )
     )
 
 
-# =====================================
-# 8. СОЗДАНИЕ ЗАКАЗА
-# =====================================
+# ==================================================
+# ПОКУПКА
+# ==================================================
 
 @bot.callback_query_handler(
-    func=lambda c: c.data == "buy_steam"
+    func=lambda call: call.data.startswith("buy:")
 )
-def buy(call):
-    bot.answer_callback_query(call.id)
+def buy_product(call):
+
+    product_id = call.data.split(":", 1)[1]
+    product = PRODUCTS.get(product_id)
+
+    if not product:
+        bot.answer_callback_query(
+            call.id,
+            "Товар не найден.",
+            show_alert=True
+        )
+        return
 
     user = call.from_user
     save_user(user)
 
-    order_id = uuid.uuid4().hex[:8].upper()
+    order_id = uuid.uuid4().hex[:10].upper()
 
-    orders_db[order_id] = {
-        "user_id": user.id,
-        "chat_id": call.message.chat.id,
-        "product": "Steam Gift Card",
-        "price": PRODUCT_PRICE,
-        "status": "Ожидает оплаты"
-    }
+    status = "Ожидает проверки администратором"
 
-    save_order(order_id)
+    saved = save_order(
+        order_id,
+        user.id,
+        product["name"],
+        product["price"],
+        status
+    )
+
+    if not saved:
+        bot.answer_callback_query(
+            call.id,
+            "Не удалось создать заказ.",
+            show_alert=True
+        )
+        return
+
+    bot.answer_callback_query(
+        call.id,
+        "Заказ создан!"
+    )
+
+    if USDT_ADDRESS:
+
+        payment_info = (
+            f"Сеть: TRC20\n"
+            f"Адрес: <code>{USDT_ADDRESS}</code>"
+        )
+
+    else:
+
+        payment_info = (
+            "Оплата пока не подключена. "
+            "Ожидай инструкции от администратора."
+        )
 
     bot.send_message(
-        call.message.chat.id,
-        f"✅ Заказ №{order_id} создан!\n\n"
-        "🎁 Steam Gift Card\n"
-        f"💰 Сумма: {PRODUCT_PRICE:g} USDT\n"
-        f"🌐 Сеть: {PAYMENT_NETWORK}\n\n"
-        "💳 Адрес для демонстрации:\n"
-        f"{PAYMENT_ADDRESS}\n\n"
-        "⚠️ ВНИМАНИЕ!\n"
-        "Это тестовая заглушка, а не настоящий адрес.\n"
-        "Не отправляйте на него криптовалюту.\n\n"
-        "После реальной оплаты администратор сможет "
-        "вручную подтвердить заказ."
+        user.id,
+        "✅ <b>Заказ создан!</b>\n\n"
+        f"Номер: <code>{order_id}</code>\n"
+        f"Товар: {product['name']}\n"
+        f"Цена: <b>{product['price']} USDT</b>\n"
+        f"Статус: {status}\n\n"
+        f"{payment_info}\n\n"
+        "Автоматическая проверка оплаты и выдача "
+        "цифрового кода пока не подключены.",
+        parse_mode="HTML",
+        reply_markup=main_menu(user.id)
     )
 
-    keyboard = InlineKeyboardMarkup()
+    admin_keyboard = types.InlineKeyboardMarkup()
 
-    keyboard.add(
-        InlineKeyboardButton(
-            "✅ Подтвердить оплату",
-            callback_data=f"approve:{order_id}"
-        )
-    )
-
-    keyboard.add(
-        InlineKeyboardButton(
+    admin_keyboard.row(
+        types.InlineKeyboardButton(
+            "✅ Подтвердить",
+            callback_data=f"order_ok:{order_id}"
+        ),
+        types.InlineKeyboardButton(
             "❌ Отклонить",
-            callback_data=f"reject:{order_id}"
+            callback_data=f"order_no:{order_id}"
         )
+    )
+
+    username = (
+        f"@{user.username}"
+        if user.username
+        else "не указан"
     )
 
     bot.send_message(
         ADMIN_ID,
-        f"🆕 НОВЫЙ ЗАКАЗ №{order_id}\n\n"
-        f"👤 Покупатель: @{user.username or 'без username'}\n"
-        f"🆔 ID: {user.id}\n"
-        "🎁 Steam Gift Card\n"
-        f"💰 {PRODUCT_PRICE:g} USDT\n"
-        f"🌐 Сеть: {PAYMENT_NETWORK}\n\n"
-        "⚠️ Оплату нужно проверять вручную.",
-        reply_markup=keyboard
+        "🆕 <b>Новый заказ!</b>\n\n"
+        f"Номер: <code>{order_id}</code>\n"
+        f"Покупатель: {user.first_name}\n"
+        f"Username: {username}\n"
+        f"ID: <code>{user.id}</code>\n"
+        f"Товар: {product['name']}\n"
+        f"Цена: {product['price']} USDT",
+        parse_mode="HTML",
+        reply_markup=admin_keyboard
     )
 
 
-# =====================================
-# 9. ПОДТВЕРЖДЕНИЕ И ОТКЛОНЕНИЕ ЗАКАЗА
-# =====================================
+# ==================================================
+# ПОДТВЕРЖДЕНИЕ ЗАКАЗОВ
+# ==================================================
 
 @bot.callback_query_handler(
-    func=lambda c: (
-        c.data.startswith("approve:")
-        or c.data.startswith("reject:")
-    )
+    func=lambda call: call.data.startswith("order_ok:")
 )
-def manage_order(call):
+def confirm_order(call):
 
     if call.from_user.id != ADMIN_ID:
         bot.answer_callback_query(
             call.id,
-            "⛔ Нет доступа."
+            "Нет доступа.",
+            show_alert=True
         )
         return
 
-    action, order_id = call.data.split(":", 1)
+    order_id = call.data.split(":", 1)[1]
 
-    if order_id not in orders_db:
-        bot.answer_callback_query(
-            call.id,
-            "Заказ не найден."
-        )
-        return
-
-    order = orders_db[order_id]
-
-    if order["status"] != "Ожидает оплаты":
-        bot.answer_callback_query(
-            call.id,
-            "Заказ уже обработан."
-        )
-        return
-
-    if action == "approve":
-
-        order["status"] = "Оплата подтверждена"
-
-        text = "✅ Оплата подтверждена администратором!"
-
-    else:
-
-        order["status"] = "Отклонён"
-
-        text = "❌ Заказ отклонён."
-
-    save_order(order_id)
+    update_order(
+        order_id,
+        "Подтверждён администратором"
+    )
 
     bot.answer_callback_query(
         call.id,
-        "Статус изменён."
+        "Заказ подтверждён."
     )
 
     bot.send_message(
-        order["chat_id"],
-        f"📦 ОБНОВЛЕНИЕ ЗАКАЗА №{order_id}\n\n{text}"
-    )
-
-    bot.edit_message_text(
-        f"📋 ЗАКАЗ №{order_id}\n\n{text}",
-        call.message.chat.id,
-        call.message.message_id
+        ADMIN_ID,
+        f"✅ Заказ {order_id} подтверждён."
     )
 
 
-# =====================================
-# 10. МОИ ЗАКАЗЫ
-# =====================================
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("order_no:")
+)
+def reject_order(call):
+
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(
+            call.id,
+            "Нет доступа.",
+            show_alert=True
+        )
+        return
+
+    order_id = call.data.split(":", 1)[1]
+
+    update_order(
+        order_id,
+        "Отклонён администратором"
+    )
+
+    bot.answer_callback_query(
+        call.id,
+        "Заказ отклонён."
+    )
+
+    bot.send_message(
+        ADMIN_ID,
+        f"❌ Заказ {order_id} отклонён."
+    )
+
+
+# ==================================================
+# МОИ ЗАКАЗЫ
+# ==================================================
 
 @bot.message_handler(
     func=lambda m: m.text == "📦 Мои заказы"
 )
 def my_orders(message):
 
-    user_orders = [
-        (order_id, order)
-        for order_id, order in orders_db.items()
-        if order["user_id"] == message.from_user.id
-    ]
+    try:
 
-    if not user_orders:
+        orders = (
+            db.table("orders")
+            .select("*")
+            .eq("user_id", message.from_user.id)
+            .execute()
+            .data
+        )
+
+    except Exception as error:
+
+        print("Ошибка загрузки заказов:", error)
+
         bot.send_message(
             message.chat.id,
-            "📦 У вас пока нет заказов."
+            "Не удалось загрузить заказы."
         )
         return
 
-    text = "📦 ВАШИ ЗАКАЗЫ\n\n"
+    if not orders:
 
-    for order_id, order in user_orders:
+        bot.send_message(
+            message.chat.id,
+            "У тебя пока нет заказов."
+        )
+        return
+
+    text = "📦 <b>Мои заказы</b>\n\n"
+
+    for order in orders:
 
         text += (
-            f"№{order_id}\n"
-            f"Товар: {order['product']}\n"
-            f"Цена: {order['price']:g} USDT\n"
-            f"Статус: {order['status']}\n\n"
+            f"Номер: <code>{order.get('order_id')}</code>\n"
+            f"Товар: {order.get('product')}\n"
+            f"Цена: {order.get('price')} USDT\n"
+            f"Статус: {order.get('status')}\n\n"
         )
 
     bot.send_message(
         message.chat.id,
-        text
+        text,
+        parse_mode="HTML"
     )
 
 
-# =====================================
-# 11. ПОДДЕРЖКА
-# =====================================
+# ==================================================
+# ПОДДЕРЖКА
+# ==================================================
+
+support_waiting = set()
+
 
 @bot.message_handler(
     func=lambda m: m.text == "💬 Поддержка"
 )
-def support(message):
+def support_start(message):
 
-    save_user(message.from_user)
+    support_waiting.add(message.from_user.id)
 
-    support_users.add(message.from_user.id)
-
-    save_chat(
-        message.from_user.id,
-        True
+    keyboard = types.ReplyKeyboardMarkup(
+        resize_keyboard=True
     )
+
+    keyboard.add("Отмена")
 
     bot.send_message(
         message.chat.id,
-        "💬 ПОДДЕРЖКА\n\n"
-        "Напишите свой вопрос. "
-        "Администратор получит сообщение."
+        "💬 Напиши сообщение для администратора.",
+        reply_markup=keyboard
     )
 
 
-# =====================================
-# 12. АДМИН: ЗАКАЗЫ
-# =====================================
-
-@bot.callback_query_handler(
-    func=lambda c: c.data == "admin_orders"
+@bot.message_handler(
+    func=lambda m: m.text == "Отмена"
 )
-def admin_orders(call):
+def support_cancel(message):
 
-    if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(
-            call.id,
-            "Нет доступа."
-        )
-        return
-
-    bot.answer_callback_query(call.id)
-
-    if not orders_db:
-        bot.send_message(
-            ADMIN_ID,
-            "📋 Заказов пока нет."
-        )
-        return
-
-    for order_id, order in orders_db.items():
-
-        bot.send_message(
-            ADMIN_ID,
-            f"📋 ЗАКАЗ №{order_id}\n\n"
-            f"Товар: {order['product']}\n"
-            f"Цена: {order['price']:g} USDT\n"
-            f"Статус: {order['status']}\n"
-            f"ID покупателя: {order['user_id']}"
-        )
-
-
-# =====================================
-# 13. АДМИН: ПОКУПАТЕЛИ
-# =====================================
-
-@bot.callback_query_handler(
-    func=lambda c: c.data == "admin_users"
-)
-def admin_users(call):
-
-    if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(
-            call.id,
-            "Нет доступа."
-        )
-        return
-
-    bot.answer_callback_query(call.id)
-
-    if not users_db:
-        bot.send_message(
-            ADMIN_ID,
-            "Покупателей пока нет."
-        )
-        return
+    support_waiting.discard(message.from_user.id)
 
     bot.send_message(
-        ADMIN_ID,
-        "👥 СПИСОК ПОКУПАТЕЛЕЙ"
+        message.chat.id,
+        "Поддержка закрыта.",
+        reply_markup=main_menu(message.from_user.id)
     )
 
-    for user_id, user in users_db.items():
 
-        bot.send_message(
-            ADMIN_ID,
-            f"👤 {user['first_name']}\n"
-            f"Username: @{user['username']}\n"
-            f"ID: {user_id}"
-        )
-
-
-# =====================================
-# 14. АДМИН: ДИАЛОГИ
-# =====================================
-
-@bot.callback_query_handler(
-    func=lambda c: c.data == "admin_chats"
+@bot.message_handler(
+    func=lambda m: (
+        m.from_user.id in support_waiting
+        and bool(m.text)
+        and m.text != "Отмена"
+    )
 )
-def admin_chats(call):
+def support_message(message):
 
-    if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(
-            call.id,
-            "Нет доступа."
-        )
-        return
+    user = message.from_user
 
-    bot.answer_callback_query(call.id)
-
-    if not support_users:
-        bot.send_message(
-            ADMIN_ID,
-            "💬 Открытых диалогов нет."
-        )
-        return
-
-    for user_id in support_users:
-
-        user = users_db.get(user_id, {})
-
-        keyboard = InlineKeyboardMarkup()
-
-        keyboard.add(
-            InlineKeyboardButton(
-                "✍️ Ответить",
-                callback_data=f"support_reply:{user_id}"
-            )
-        )
-
-        keyboard.add(
-            InlineKeyboardButton(
-                "🔒 Завершить",
-                callback_data=f"support_close:{user_id}"
-            )
-        )
-
-        bot.send_message(
-            ADMIN_ID,
-            f"💬 Диалог\n\n"
-            f"Покупатель: @{user.get('username', 'без username')}\n"
-            f"ID: {user_id}",
-            reply_markup=keyboard
-        )
-
-
-# =====================================
-# 15. АДМИН: СТАТИСТИКА
-# =====================================
-
-@bot.callback_query_handler(
-    func=lambda c: c.data == "admin_stats"
-)
-def admin_stats(call):
-
-    if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(
-            call.id,
-            "Нет доступа."
-        )
-        return
-
-    bot.answer_callback_query(call.id)
-
-    total = len(orders_db)
-
-    pending = sum(
-        1 for order in orders_db.values()
-        if order["status"] == "Ожидает оплаты"
-    )
-
-    approved = sum(
-        1 for order in orders_db.values()
-        if order["status"] == "Оплата подтверждена"
-    )
-
-    rejected = sum(
-        1 for order in orders_db.values()
-        if order["status"] == "Отклонён"
+    username = (
+        f"@{user.username}"
+        if user.username
+        else "не указан"
     )
 
     bot.send_message(
         ADMIN_ID,
-        "📊 СТАТИСТИКА МАГАЗИНА\n\n"
-        f"👥 Покупателей: {len(users_db)}\n"
-        f"📦 Всего заказов: {total}\n"
-        f"🕒 Ожидают оплаты: {pending}\n"
-        f"✅ Оплата подтверждена: {approved}\n"
-        f"❌ Отклонены: {rejected}\n"
-        f"💬 Открытые диалоги: {len(support_users)}"
+        "💬 <b>Сообщение в поддержку</b>\n\n"
+        f"Пользователь: {user.first_name}\n"
+        f"Username: {username}\n"
+        f"ID: <code>{user.id}</code>\n\n"
+        f"{message.text}",
+        parse_mode="HTML"
+    )
+
+    support_waiting.discard(user.id)
+
+    bot.send_message(
+        message.chat.id,
+        "✅ Сообщение отправлено администратору.",
+        reply_markup=main_menu(user.id)
     )
 
 
-# =====================================
-# 16. АДМИН: ТОВАРЫ И ЦЕНЫ
-# =====================================
+# ==================================================
+# АДМИН-ПАНЕЛЬ
+# ==================================================
+
+def admin_panel(chat_id):
+
+    keyboard = types.InlineKeyboardMarkup()
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "📋 Заказы",
+            callback_data="admin_orders"
+        )
+    )
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "👥 Покупатели",
+            callback_data="admin_users"
+        )
+    )
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "📊 Статистика",
+            callback_data="admin_stats"
+        )
+    )
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "🛍 Товары и цены",
+            callback_data="admin_products"
+        )
+    )
+
+    bot.send_message(
+        chat_id,
+        "⚙️ <b>Админ-панель</b>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+@bot.message_handler(
+    commands=["admin"]
+)
+def admin_command(message):
+
+    if message.from_user.id != ADMIN_ID:
+
+        bot.send_message(
+            message.chat.id,
+            "⛔ Нет доступа."
+        )
+        return
+
+    admin_panel(message.chat.id)
+
+
+@bot.message_handler(
+    func=lambda m: m.text == "⚙️ Админ-панель"
+)
+def admin_button(message):
+
+    if message.from_user.id == ADMIN_ID:
+        admin_panel(message.chat.id)
+
 
 @bot.callback_query_handler(
-    func=lambda c: c.data == "admin_products"
+    func=lambda call: call.data == "admin_products"
 )
 def admin_products(call):
 
     if call.from_user.id != ADMIN_ID:
         bot.answer_callback_query(
             call.id,
-            "Нет доступа."
+            "Нет доступа.",
+            show_alert=True
         )
         return
 
     bot.answer_callback_query(call.id)
 
-    keyboard = InlineKeyboardMarkup()
+    text = "🛍 <b>Товары магазина</b>\n\n"
 
-    keyboard.add(
-        InlineKeyboardButton(
-            "✏️ Изменить цену",
-            callback_data="change_price"
+    for product in PRODUCTS.values():
+
+        text += (
+            f"• {product['name']}\n"
+            f"Цена: {product['price']} USDT\n\n"
         )
+
+    text += (
+        "Чтобы изменить цену, открой файл bot.py "
+        "и измени значение price у нужного товара."
     )
 
     bot.send_message(
         ADMIN_ID,
-        "⚙️ УПРАВЛЕНИЕ ТОВАРАМИ\n\n"
-        "🎁 Steam Gift Card\n"
-        f"Текущая цена: {PRODUCT_PRICE:g} USDT\n\n"
-        "Выберите действие:",
-        reply_markup=keyboard
+        text,
+        parse_mode="HTML"
     )
 
 
 @bot.callback_query_handler(
-    func=lambda c: c.data == "change_price"
+    func=lambda call: call.data == "admin_orders"
 )
-def change_price(call):
-    global waiting_price
+def admin_orders(call):
 
     if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(
-            call.id,
-            "Нет доступа."
-        )
+        bot.answer_callback_query(call.id, "Нет доступа.")
         return
-
-    waiting_price = True
 
     bot.answer_callback_query(call.id)
-
-    bot.send_message(
-        ADMIN_ID,
-        "✏️ Отправьте новую цену числом.\n\n"
-        "Например: 15 или 12.5"
-    )
-
-
-# =====================================
-# 17. ОТВЕТЫ ПОДДЕРЖКИ
-# =====================================
-
-@bot.callback_query_handler(
-    func=lambda c: c.data.startswith("support_reply:")
-)
-def support_reply(call):
-    global active_admin_chat
-
-    if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(
-            call.id,
-            "Нет доступа."
-        )
-        return
-
-    user_id = int(call.data.split(":", 1)[1])
-
-    if user_id not in support_users:
-        bot.answer_callback_query(
-            call.id,
-            "Диалог закрыт."
-        )
-        return
-
-    active_admin_chat = user_id
-
-    bot.answer_callback_query(
-        call.id,
-        "Диалог выбран."
-    )
-
-    bot.send_message(
-        ADMIN_ID,
-        f"✍️ Вы отвечаете покупателю {user_id}.\n"
-        "Следующие текстовые сообщения будут отправляться ему."
-    )
-
-
-@bot.callback_query_handler(
-    func=lambda c: c.data.startswith("support_close:")
-)
-def support_close(call):
-    global active_admin_chat
-
-    if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(
-            call.id,
-            "Нет доступа."
-        )
-        return
-
-    user_id = int(call.data.split(":", 1)[1])
-
-    support_users.discard(user_id)
-
-    save_chat(user_id, False)
-
-    if active_admin_chat == user_id:
-        active_admin_chat = None
-
-    bot.answer_callback_query(
-        call.id,
-        "Диалог завершён."
-    )
-
-    bot.send_message(
-        user_id,
-        "🔒 Диалог с поддержкой завершён."
-    )
-
-    bot.send_message(
-        ADMIN_ID,
-        f"Диалог с покупателем {user_id} закрыт."
-    )
-
-
-# =====================================
-# 18. ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ
-# =====================================
-
-@bot.message_handler(content_types=["text"])
-def handle_text(message):
-    global active_admin_chat
-    global waiting_price
-    global PRODUCT_PRICE
-
-    user_id = message.from_user.id
-    text = message.text.strip()
-
-    # ---------------------------------
-    # Изменение цены администратором
-    # ---------------------------------
-
-    if user_id == ADMIN_ID and waiting_price:
-
-        try:
-            new_price = float(
-                text.replace(",", ".")
-            )
-
-            if new_price <= 0 or new_price > 100000:
-                raise ValueError
-
-            PRODUCT_PRICE = new_price
-
-            db.table("shop_settings").upsert({
-                "setting_name": "product_price",
-                "setting_value": str(PRODUCT_PRICE)
-            }).execute()
-
-            waiting_price = False
-
-            bot.send_message(
-                ADMIN_ID,
-                f"✅ Новая цена сохранена: "
-                f"{PRODUCT_PRICE:g} USDT"
-            )
-
-        except ValueError:
-
-            bot.send_message(
-                ADMIN_ID,
-                "❌ Неверная цена.\n"
-                "Введи положительное число."
-            )
-
-        except Exception as error:
-
-            print("Ошибка сохранения цены:", error)
-
-            bot.send_message(
-                ADMIN_ID,
-                "❌ Не удалось сохранить цену в базе данных."
-            )
-
-        return
-
-    # ---------------------------------
-    # Ответ администратора покупателю
-    # ---------------------------------
-
-    if user_id == ADMIN_ID and active_admin_chat is not None:
-
-        target_id = active_admin_chat
-
-        if target_id not in support_users:
-
-            active_admin_chat = None
-
-            bot.send_message(
-                ADMIN_ID,
-                "Диалог уже закрыт."
-            )
-
-            return
-
-        try:
-            bot.send_message(
-                target_id,
-                "💬 ОТВЕТ ПОДДЕРЖКИ\n\n" + text
-            )
-
-            save_message(
-                target_id,
-                "admin",
-                text
-            )
-
-            bot.send_message(
-                ADMIN_ID,
-                "✅ Сообщение отправлено."
-            )
-
-        except Exception as error:
-
-            print("Ошибка отправки ответа:", error)
-
-            bot.send_message(
-                ADMIN_ID,
-                "❌ Не удалось отправить сообщение."
-            )
-
-        return
-
-    # ---------------------------------
-    # Сообщение от покупателя
-    # ---------------------------------
-
-    if user_id in support_users:
-
-        try:
-            save_user(message.from_user)
-
-            save_message(
-                user_id,
-                "user",
-                text
-            )
-
-            keyboard = InlineKeyboardMarkup()
-
-            keyboard.add(
-                InlineKeyboardButton(
-                    "✍️ Ответить",
-                    callback_data=f"support_reply:{user_id}"
-                )
-            )
-
-            keyboard.add(
-                InlineKeyboardButton(
-                    "🔒 Завершить",
-                    callback_data=f"support_close:{user_id}"
-                )
-            )
-
-            bot.send_message(
-                ADMIN_ID,
-                f"💬 НОВОЕ СООБЩЕНИЕ\n\n"
-                f"👤 {message.from_user.first_name}\n"
-                f"🆔 ID: {user_id}\n\n"
-                f"Сообщение:\n{text}",
-                reply_markup=keyboard
-            )
-
-            bot.send_message(
-                message.chat.id,
-                "✅ Сообщение передано администратору."
-            )
-
-        except Exception as error:
-
-            print("Ошибка поддержки:", error)
-
-            bot.send_message(
-                message.chat.id,
-                "❌ Не удалось отправить сообщение. "
-                "Попробуйте позже."
-            )
-
-        return
-
-    # ---------------------------------
-    # Остальные сообщения
-    # ---------------------------------
-
-    bot.send_message(
-        message.chat.id,
-        "Выберите раздел в меню."
-    )
-
-
-# =====================================
-# 19. ЗАПУСК БОТА
-# =====================================
-
-if __name__ == "__main__":
 
     try:
-        load_data()
 
-        print("Telegram bot started successfully.")
-
-        bot.infinity_polling(
-            skip_pending=True,
-            timeout=30,
-            long_polling_timeout=30
+        orders = (
+            db.table("orders")
+            .select("*")
+            .execute()
+            .data
         )
 
     except Exception as error:
 
-        print("КРИТИЧЕСКАЯ ОШИБКА:", error)
+        bot.send_message(
+            ADMIN_ID,
+            f"Ошибка: {error}"
+        )
+        return
 
-        raise
+    if not orders:
+
+        bot.send_message(
+            ADMIN_ID,
+            "Заказов пока нет."
+        )
+        return
+
+    for order in orders[-20:]:
+
+        bot.send_message(
+            ADMIN_ID,
+            f"Заказ: {order.get('order_id')}\n"
+            f"Покупатель ID: {order.get('user_id')}\n"
+            f"Товар: {order.get('product')}\n"
+            f"Цена: {order.get('price')} USDT\n"
+            f"Статус: {order.get('status')}"
+        )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_users"
+)
+def admin_users(call):
+
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Нет доступа.")
+        return
+
+    bot.answer_callback_query(call.id)
+
+    try:
+
+        users = (
+            db.table("users")
+            .select("*")
+            .execute()
+            .data
+        )
+
+    except Exception as error:
+
+        bot.send_message(
+            ADMIN_ID,
+            f"Ошибка: {error}"
+        )
+        return
+
+    if not users:
+
+        bot.send_message(
+            ADMIN_ID,
+            "Покупателей пока нет."
+        )
+        return
+
+    text = "👥 <b>Покупатели</b>\n\n"
+
+    for user in users[-30:]:
+
+        text += (
+            f"{user.get('first_name', 'Без имени')} "
+            f"— ID: <code>{user.get('user_id')}</code>\n"
+        )
+
+    bot.send_message(
+        ADMIN_ID,
+        text,
+        parse_mode="HTML"
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_stats"
+)
+def admin_stats(call):
+
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Нет доступа.")
+        return
+
+    bot.answer_callback_query(call.id)
+
+    try:
+
+        orders = (
+            db.table("orders")
+            .select("*")
+            .execute()
+            .data
+        )
+
+        users = (
+            db.table("users")
+            .select("*")
+            .execute()
+            .data
+        )
+
+        total = sum(
+            float(order.get("price") or 0)
+            for order in orders
+        )
+
+        bot.send_message(
+            ADMIN_ID,
+            "📊 <b>Статистика магазина</b>\n\n"
+            f"Покупателей: {len(users)}\n"
+            f"Заказов: {len(orders)}\n"
+            f"Сумма заказов: {total:.2f} USDT",
+            parse_mode="HTML"
+        )
+
+    except Exception as error:
+
+        bot.send_message(
+            ADMIN_ID,
+            f"Ошибка статистики: {error}"
+        )
+
+
+# ==================================================
+# НЕИЗВЕСТНЫЕ СООБЩЕНИЯ
+# ==================================================
+
+@bot.message_handler(
+    func=lambda m: True,
+    content_types=["text"]
+)
+def other_messages(message):
+
+    bot.send_message(
+        message.chat.id,
+        "Выбери действие в меню.",
+        reply_markup=main_menu(message.from_user.id)
+    )
+
+
+# ==================================================
+# ЗАПУСК
+# ==================================================
+
+if __name__ == "__main__":
+
+    print("Бот запускается...")
+    print("Товаров в каталоге:", len(PRODUCTS))
+
+    bot.infinity_polling(
+        skip_pending=True,
+        timeout=30,
+        long_polling_timeout=30
+    )
