@@ -15,8 +15,10 @@ ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 bot = telebot.TeleBot(TOKEN)
 
-# Временное хранение заказов
+# Временное хранение заказов и обращений
 orders_db = {}
+waiting_support = set()
+waiting_admin_reply = {}
 
 
 # =========================
@@ -101,16 +103,10 @@ def show_category(call):
         )
 
     elif call.data == "cat_games":
-        text = (
-            "🎮 КЛЮЧИ ИГР\n\n"
-            "Пока товаров нет."
-        )
+        text = "🎮 КЛЮЧИ ИГР\n\nПока товаров нет."
 
     else:
-        text = (
-            "⭐ ПОДПИСКИ\n\n"
-            "Пока товаров нет."
-        )
+        text = "⭐ ПОДПИСКИ\n\nПока товаров нет."
 
     keyboard.add(
         InlineKeyboardButton(
@@ -242,33 +238,23 @@ def manage_order(call):
     action, order_id = call.data.split(":", 1)
 
     if order_id not in orders_db:
-        bot.answer_callback_query(
-            call.id,
-            "Заказ не найден."
-        )
+        bot.answer_callback_query(call.id, "Заказ не найден.")
         return
 
     order = orders_db[order_id]
 
     if order["status"] != "Ожидает решения":
-        bot.answer_callback_query(
-            call.id,
-            "Этот заказ уже обработан."
-        )
+        bot.answer_callback_query(call.id, "Заказ уже обработан.")
         return
 
     if action == "approve":
         order["status"] = "Подтверждён"
         text = f"✅ Заказ №{order_id} подтверждён!"
-
     else:
         order["status"] = "Отклонён"
         text = f"❌ Заказ №{order_id} отклонён."
 
-    bot.answer_callback_query(
-        call.id,
-        "Статус изменён."
-    )
+    bot.answer_callback_query(call.id, "Статус изменён.")
 
     bot.send_message(
         order["chat_id"],
@@ -283,24 +269,18 @@ def manage_order(call):
 
 
 # =========================
-# ЗАКАЗЫ АДМИНИСТРАТОРА
+# СПИСОК ЗАКАЗОВ АДМИНИСТРАТОРА
 # =========================
 
 @bot.message_handler(commands=['orders'])
 def show_orders(message):
 
     if message.from_user.id != ADMIN_ID:
-        bot.send_message(
-            message.chat.id,
-            "⛔ Нет доступа."
-        )
+        bot.send_message(message.chat.id, "⛔ Нет доступа.")
         return
 
     if not orders_db:
-        bot.send_message(
-            message.chat.id,
-            "📋 Заказов пока нет."
-        )
+        bot.send_message(message.chat.id, "📋 Заказов пока нет.")
         return
 
     text = "📋 СПИСОК ЗАКАЗОВ\n\n"
@@ -313,10 +293,7 @@ def show_orders(message):
             f"Статус: {order['status']}\n\n"
         )
 
-    bot.send_message(
-        message.chat.id,
-        text
-    )
+    bot.send_message(message.chat.id, text)
 
 
 # =========================
@@ -349,23 +326,126 @@ def my_orders(message):
             f"Статус: {order['status']}\n\n"
         )
 
-    bot.send_message(
-        message.chat.id,
-        text
-    )
+    bot.send_message(message.chat.id, text)
 
 
 # =========================
-# ПОДДЕРЖКА
+# ПОДДЕРЖКА ПОКУПАТЕЛЕЙ
 # =========================
 
 @bot.message_handler(func=lambda m: m.text == "💬 Поддержка")
 def support(message):
 
+    waiting_support.add(message.from_user.id)
+
     bot.send_message(
         message.chat.id,
-        "💬 Поддержка\n\n"
-        "Напишите свой вопрос одним сообщением."
+        "💬 ПОДДЕРЖКА\n\n"
+        "Напишите свой вопрос одним сообщением.\n"
+        "Я передам его администратору."
+    )
+
+
+# =========================
+# ОТВЕТ АДМИНИСТРАТОРА
+# =========================
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("support_reply:")
+)
+def support_reply_button(call):
+
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(
+            call.id,
+            "⛔ Нет доступа.",
+            show_alert=True
+        )
+        return
+
+    user_id = int(call.data.split(":", 1)[1])
+
+    waiting_admin_reply[ADMIN_ID] = user_id
+
+    bot.answer_callback_query(call.id)
+
+    bot.send_message(
+        ADMIN_ID,
+        f"✍️ Напишите ответ покупателю с ID {user_id}."
+    )
+
+
+# =========================
+# ОБРАБОТКА СООБЩЕНИЙ
+# =========================
+
+@bot.message_handler(content_types=['text'])
+def handle_text(message):
+
+    user_id = message.from_user.id
+    text = message.text
+
+    # Администратор отвечает покупателю
+    if user_id == ADMIN_ID and ADMIN_ID in waiting_admin_reply:
+
+        target_id = waiting_admin_reply.pop(ADMIN_ID)
+
+        try:
+            bot.send_message(
+                target_id,
+                "💬 ОТВЕТ ПОДДЕРЖКИ\n\n" + text
+            )
+
+            bot.send_message(
+                ADMIN_ID,
+                "✅ Ответ отправлен покупателю."
+            )
+
+        except Exception:
+            bot.send_message(
+                ADMIN_ID,
+                "❌ Не удалось отправить сообщение."
+            )
+
+        return
+
+    # Покупатель отправляет вопрос
+    if user_id in waiting_support:
+
+        waiting_support.discard(user_id)
+
+        username = message.from_user.username or "без username"
+
+        keyboard = InlineKeyboardMarkup()
+
+        keyboard.add(
+            InlineKeyboardButton(
+                "✍️ Ответить",
+                callback_data=f"support_reply:{user_id}"
+            )
+        )
+
+        bot.send_message(
+            ADMIN_ID,
+            f"💬 НОВОЕ ОБРАЩЕНИЕ В ПОДДЕРЖКУ\n\n"
+            f"👤 Покупатель: @{username}\n"
+            f"🆔 ID: {user_id}\n\n"
+            f"Сообщение:\n{text}",
+            reply_markup=keyboard
+        )
+
+        bot.send_message(
+            message.chat.id,
+            "✅ Ваше сообщение отправлено администратору.\n"
+            "Ожидайте ответа."
+        )
+
+        return
+
+    # Обычное сообщение
+    bot.send_message(
+        message.chat.id,
+        "Выберите раздел в меню или нажмите «💬 Поддержка»."
     )
 
 
