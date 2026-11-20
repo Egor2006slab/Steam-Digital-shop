@@ -1,6 +1,7 @@
 import os
 import uuid
 import html
+from decimal import Decimal, InvalidOperation
 
 import telebot
 from telebot import types
@@ -27,19 +28,71 @@ ADMIN_ID = int(ADMIN_ID_RAW)
 bot = telebot.TeleBot(BOT_TOKEN)
 db = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-USDT_ADDRESS = ""
-
 CATEGORIES = {
     "gifts": "🎁 Подарочные карты",
     "games": "🎮 Игры",
     "subs": "⭐ Подписки"
 }
 
-# Состояния действий администратора
 admin_states = {}
-
-# Состояния поддержки
 support_waiting = set()
+topup_waiting = set()
+
+
+# ==================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ==================================================
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+
+def money(value):
+    try:
+        return Decimal(str(value)).quantize(Decimal("0.01"))
+    except Exception:
+        return Decimal("0.00")
+
+
+def money_text(value):
+    return f"{money(value):.2f}"
+
+
+def get_user_record(user_id):
+    try:
+        result = (
+            db.table("users")
+            .select("*")
+            .eq("user_id", user_id)
+            .execute()
+            .data
+        )
+
+        return result[0] if result else None
+
+    except Exception as error:
+        print("Ошибка загрузки пользователя:", error)
+        return None
+
+
+def get_balance(user_id):
+    user = get_user_record(user_id)
+
+    if not user:
+        return Decimal("0.00")
+
+    return money(user.get("balance", 0))
+
+
+def notify_user(user_id, text):
+    try:
+        bot.send_message(
+            user_id,
+            text,
+            parse_mode="HTML"
+        )
+    except Exception as error:
+        print("Не удалось отправить сообщение пользователю:", error)
 
 
 # ==================================================
@@ -135,7 +188,7 @@ def delete_product(product_id):
 
 
 # ==================================================
-# БАЗА ДАННЫХ: ПОКУПАТЕЛИ И ЗАКАЗЫ
+# БАЗА ДАННЫХ: ПОКУПАТЕЛИ
 # ==================================================
 
 def save_user(user):
@@ -166,21 +219,25 @@ def save_user(user):
         print("Ошибка сохранения пользователя:", error)
 
 
-def save_order(order_id, user_id, product, price, status):
-    try:
-        db.table("orders").insert({
-            "order_id": order_id,
-            "user_id": user_id,
-            "product": product,
-            "price": float(price),
-            "status": status
-        }).execute()
+# ==================================================
+# БАЗА ДАННЫХ: ЗАКАЗЫ
+# ==================================================
 
-        return True
+def get_order(order_id):
+    try:
+        result = (
+            db.table("orders")
+            .select("*")
+            .eq("order_id", order_id)
+            .execute()
+            .data
+        )
+
+        return result[0] if result else None
 
     except Exception as error:
-        print("Ошибка сохранения заказа:", error)
-        return False
+        print("Ошибка получения заказа:", error)
+        return None
 
 
 def update_order(order_id, status):
@@ -196,8 +253,25 @@ def update_order(order_id, status):
         return False
 
 
-def is_admin(user_id):
-    return user_id == ADMIN_ID
+# ==================================================
+# БАЛАНС: ИСТОРИЯ
+# ==================================================
+
+def get_balance_history(user_id):
+    try:
+        return (
+            db.table("balance_transactions")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute()
+            .data or []
+        )
+
+    except Exception as error:
+        print("Ошибка истории баланса:", error)
+        return None
 
 
 # ==================================================
@@ -210,12 +284,183 @@ def main_menu(user_id):
     )
 
     keyboard.row("🛍 Каталог", "📦 Мои заказы")
+    keyboard.row("👤 Мой профиль", "💳 Пополнить баланс")
     keyboard.row("💬 Поддержка")
 
     if is_admin(user_id):
         keyboard.row("⚙️ Админ-панель")
 
     return keyboard
+
+
+# ==================================================
+# ПРОФИЛЬ ПОКУПАТЕЛЯ
+# ==================================================
+
+@bot.message_handler(func=lambda m: m.text == "👤 Мой профиль")
+def show_profile(message):
+    user_id = message.from_user.id
+    save_user(message.from_user)
+
+    user = get_user_record(user_id)
+
+    if not user:
+        bot.send_message(
+            message.chat.id,
+            "Не удалось загрузить профиль."
+        )
+        return
+
+    balance = money_text(user.get("balance", 0))
+    purchased = user.get("purchased_count", 0)
+
+    keyboard = types.InlineKeyboardMarkup()
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "📜 История баланса",
+            callback_data="balance_history"
+        )
+    )
+
+    bot.send_message(
+        message.chat.id,
+        "👤 <b>Мой профиль</b>\n\n"
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"💰 Баланс: <b>{balance} USDT</b>\n"
+        f"🛍 Покупок: <b>{purchased}</b>\n\n"
+        "Для пополнения баланса воспользуйся кнопкой "
+        "«💳 Пополнить баланс».",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "balance_history")
+def show_balance_history(call):
+    bot.answer_callback_query(call.id)
+
+    history = get_balance_history(call.from_user.id)
+
+    if history is None:
+        bot.send_message(
+            call.message.chat.id,
+            "Не удалось загрузить историю."
+        )
+        return
+
+    if not history:
+        bot.send_message(
+            call.message.chat.id,
+            "📜 История операций пока пуста."
+        )
+        return
+
+    text = "📜 <b>История баланса</b>\n\n"
+
+    operation_names = {
+        "admin_credit": "➕ Начисление администратором",
+        "admin_debit": "➖ Списание администратором",
+        "purchase": "🛒 Покупка",
+        "refund": "↩️ Возврат"
+    }
+
+    for item in history:
+        operation = item.get("operation", "")
+        name = operation_names.get(operation, operation)
+
+        amount = money(item.get("amount", 0))
+
+        sign = "+" if amount > 0 else ""
+
+        description = html.escape(
+            str(item.get("description") or "")
+        )
+
+        text += (
+            f"{name}\n"
+            f"Сумма: <b>{sign}{amount:.2f} USDT</b>\n"
+            f"{description}\n\n"
+        )
+
+    bot.send_message(
+        call.message.chat.id,
+        text,
+        parse_mode="HTML"
+    )
+
+
+# ==================================================
+# РУЧНОЕ ПОПОЛНЕНИЕ: ЗАПРОС ПОКУПАТЕЛЯ
+# ==================================================
+
+@bot.message_handler(func=lambda m: m.text == "💳 Пополнить баланс")
+def start_topup(message):
+    user_id = message.from_user.id
+
+    topup_waiting.add(user_id)
+
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add("Отмена")
+
+    bot.send_message(
+        message.chat.id,
+        "💳 <b>Пополнение баланса</b>\n\n"
+        "Напиши сумму пополнения в USDT.\n\n"
+        "Например: <code>25</code>\n\n"
+        "После этого администратор получит запрос "
+        "и сообщит тебе порядок оплаты.",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.from_user.id in topup_waiting
+    and bool(m.text)
+    and m.text != "Отмена"
+)
+def process_topup_request(message):
+    user = message.from_user
+
+    try:
+        amount = Decimal(
+            message.text.replace(",", ".").strip()
+        )
+
+        if amount <= 0 or amount > Decimal("100000"):
+            raise ValueError
+
+        amount = amount.quantize(Decimal("0.01"))
+
+    except (InvalidOperation, ValueError):
+        bot.send_message(
+            message.chat.id,
+            "❌ Введи корректную сумму, например 25 или 10.50."
+        )
+        return
+
+    topup_waiting.discard(user.id)
+
+    save_user(user)
+
+    bot.send_message(
+        ADMIN_ID,
+        "💳 <b>Запрос на пополнение баланса</b>\n\n"
+        f"Покупатель: {html.escape(user.first_name or '')}\n"
+        f"Telegram ID: <code>{user.id}</code>\n"
+        f"Запрошенная сумма: <b>{amount:.2f} USDT</b>\n\n"
+        "Свяжись с покупателем через поддержку. "
+        "После проверки оплаты начисли средства через админ-панель.",
+        parse_mode="HTML"
+    )
+
+    bot.send_message(
+        message.chat.id,
+        "✅ Запрос отправлен администратору.\n\n"
+        "Дождись ответа по поводу оплаты.",
+        reply_markup=main_menu(user.id)
+    )
 
 
 # ==================================================
@@ -285,7 +530,8 @@ def start(message):
     bot.send_message(
         message.chat.id,
         "👋 Добро пожаловать в <b>Digital Shop</b>!\n\n"
-        "Выбирай товары в каталоге и оформляй заказ.",
+        "Выбирай товары в каталоге, проверяй баланс "
+        "и оформляй покупки.",
         parse_mode="HTML",
         reply_markup=main_menu(message.from_user.id)
     )
@@ -349,7 +595,7 @@ def open_product(call):
     text = (
         f"🛍 <b>{html.escape(product['name'])}</b>\n\n"
         f"{html.escape(product.get('description') or '')}\n\n"
-        f"💰 Цена: <b>{product['price']} USDT</b>"
+        f"💰 Цена: <b>{money_text(product['price'])} USDT</b>"
     )
 
     bot.edit_message_text(
@@ -365,7 +611,7 @@ def open_product(call):
 
 
 # ==================================================
-# ПОКУПКА
+# ПОКУПКА С БАЛАНСА
 # ==================================================
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("buy:"))
@@ -384,43 +630,63 @@ def buy_product(call):
     user = call.from_user
     save_user(user)
 
-    order_id = uuid.uuid4().hex[:10].upper()
-    status = "Ожидает проверки администратором"
+    price = money(product["price"])
 
-    if not save_order(
-        order_id,
-        user.id,
-        product["name"],
-        product["price"],
-        status
-    ):
+    if price <= 0:
         bot.answer_callback_query(
             call.id,
-            "Ошибка создания заказа.",
+            "Некорректная цена товара.",
             show_alert=True
         )
         return
 
-    bot.answer_callback_query(call.id, "Заказ создан!")
+    order_id = uuid.uuid4().hex[:10].upper()
 
-    if USDT_ADDRESS:
-        payment_info = (
-            f"Сеть: TRON TRC20\n"
-            f"Адрес: <code>{USDT_ADDRESS}</code>"
+    try:
+        result = db.rpc(
+            "create_paid_order",
+            {
+                "p_order_id": order_id,
+                "p_user_id": user.id,
+                "p_product": product["name"],
+                "p_price": str(price)
+            }
+        ).execute()
+
+        new_balance = money(result.data)
+
+    except Exception as error:
+        print("Ошибка покупки:", error)
+
+        current_balance = get_balance(user.id)
+
+        bot.answer_callback_query(
+            call.id,
+            "Не удалось купить товар. Проверь баланс.",
+            show_alert=True
         )
-    else:
-        payment_info = "Оплата пока не подключена."
+
+        bot.send_message(
+            user.id,
+            "❌ <b>Не удалось оформить покупку.</b>\n\n"
+            f"Текущий баланс: <b>{current_balance:.2f} USDT</b>\n"
+            f"Цена товара: <b>{price:.2f} USDT</b>\n\n"
+            "Возможно, недостаточно средств. "
+            "Если баланс достаточный, обратись в поддержку.",
+            parse_mode="HTML"
+        )
+        return
+
+    bot.answer_callback_query(call.id, "Покупка оплачена!")
 
     bot.send_message(
         user.id,
-        "✅ <b>Заказ создан!</b>\n\n"
-        f"Номер: <code>{order_id}</code>\n"
+        "✅ <b>Покупка успешно оплачена!</b>\n\n"
+        f"Номер заказа: <code>{order_id}</code>\n"
         f"Товар: {html.escape(product['name'])}\n"
-        f"Цена: <b>{product['price']} USDT</b>\n"
-        f"Статус: {status}\n\n"
-        f"{payment_info}\n\n"
-        "Автоматическая проверка оплаты и выдача товара "
-        "пока не подключены.",
+        f"Списано: <b>{price:.2f} USDT</b>\n"
+        f"Остаток: <b>{new_balance:.2f} USDT</b>\n\n"
+        "Заказ ожидает выдачи администратором.",
         parse_mode="HTML",
         reply_markup=main_menu(user.id)
     )
@@ -429,26 +695,32 @@ def buy_product(call):
 
     keyboard.row(
         types.InlineKeyboardButton(
-            "✅ Подтвердить",
+            "📦 Выдать / завершить",
             callback_data=f"order_ok:{order_id}"
         ),
         types.InlineKeyboardButton(
-            "❌ Отклонить",
+            "↩️ Отклонить и вернуть",
             callback_data=f"order_no:{order_id}"
         )
     )
 
     bot.send_message(
         ADMIN_ID,
-        "🆕 <b>Новый заказ!</b>\n\n"
+        "🆕 <b>Новая оплаченная покупка!</b>\n\n"
         f"Номер: <code>{order_id}</code>\n"
         f"Покупатель ID: <code>{user.id}</code>\n"
         f"Товар: {html.escape(product['name'])}\n"
-        f"Цена: {product['price']} USDT",
+        f"Цена: {price:.2f} USDT\n"
+        f"Остаток покупателя: {new_balance:.2f} USDT\n\n"
+        "Оплата списана с внутреннего баланса.",
         parse_mode="HTML",
         reply_markup=keyboard
     )
 
+
+# ==================================================
+# ПОДТВЕРЖДЕНИЕ ВЫДАЧИ ЗАКАЗА
+# ==================================================
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("order_ok:"))
 def confirm_order(call):
@@ -457,13 +729,50 @@ def confirm_order(call):
         return
 
     order_id = call.data.split(":", 1)[1]
+    order = get_order(order_id)
 
-    if update_order(order_id, "Подтверждён администратором"):
-        bot.answer_callback_query(call.id, "Подтверждено")
-        bot.send_message(ADMIN_ID, f"Заказ {order_id} подтверждён.")
+    if not order:
+        bot.answer_callback_query(
+            call.id,
+            "Заказ не найден.",
+            show_alert=True
+        )
+        return
+
+    if order.get("status") != "Оплачен, ожидает выдачи":
+        bot.answer_callback_query(
+            call.id,
+            "Заказ уже обработан.",
+            show_alert=True
+        )
+        return
+
+    if update_order(order_id, "Выдан покупателю"):
+        bot.answer_callback_query(call.id, "Заказ завершён.")
+
+        notify_user(
+            order["user_id"],
+            "📦 <b>Заказ выдан!</b>\n\n"
+            f"Номер: <code>{order_id}</code>\n"
+            f"Товар: {html.escape(str(order['product']))}\n\n"
+            "Спасибо за покупку!",
+        )
+
+        bot.send_message(
+            ADMIN_ID,
+            f"✅ Заказ {order_id} отмечен как выданный."
+        )
     else:
-        bot.answer_callback_query(call.id, "Ошибка обновления.")
+        bot.answer_callback_query(
+            call.id,
+            "Ошибка обновления.",
+            show_alert=True
+        )
 
+
+# ==================================================
+# ОТКЛОНЕНИЕ ЗАКАЗА И ВОЗВРАТ
+# ==================================================
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("order_no:"))
 def reject_order(call):
@@ -473,11 +782,46 @@ def reject_order(call):
 
     order_id = call.data.split(":", 1)[1]
 
-    if update_order(order_id, "Отклонён администратором"):
-        bot.answer_callback_query(call.id, "Отклонено")
-        bot.send_message(ADMIN_ID, f"Заказ {order_id} отклонён.")
-    else:
-        bot.answer_callback_query(call.id, "Ошибка обновления.")
+    try:
+        result = db.rpc(
+            "refund_paid_order",
+            {
+                "p_order_id": order_id,
+                "p_admin_id": ADMIN_ID
+            }
+        ).execute()
+
+        new_balance = money(result.data)
+
+        order = get_order(order_id)
+
+        bot.answer_callback_query(
+            call.id,
+            "Средства возвращены."
+        )
+
+        if order:
+            notify_user(
+                order["user_id"],
+                "↩️ <b>Заказ отклонён.</b>\n\n"
+                f"Номер: <code>{order_id}</code>\n"
+                f"Возвращено: <b>{money_text(order['price'])} USDT</b>\n"
+                f"Новый баланс: <b>{new_balance:.2f} USDT</b>",
+            )
+
+        bot.send_message(
+            ADMIN_ID,
+            f"↩️ Заказ {order_id} отклонён. Средства возвращены."
+        )
+
+    except Exception as error:
+        print("Ошибка возврата:", error)
+
+        bot.answer_callback_query(
+            call.id,
+            "Не удалось вернуть средства. Возможно, заказ уже обработан.",
+            show_alert=True
+        )
 
 
 # ==================================================
@@ -494,13 +838,21 @@ def my_orders(message):
             .execute()
             .data
         )
+
     except Exception as error:
         print("Ошибка заказов:", error)
-        bot.send_message(message.chat.id, "Не удалось загрузить заказы.")
+
+        bot.send_message(
+            message.chat.id,
+            "Не удалось загрузить заказы."
+        )
         return
 
     if not orders:
-        bot.send_message(message.chat.id, "Заказов пока нет.")
+        bot.send_message(
+            message.chat.id,
+            "Заказов пока нет."
+        )
         return
 
     text = "📦 <b>Мои заказы</b>\n\n"
@@ -509,7 +861,7 @@ def my_orders(message):
         text += (
             f"Номер: <code>{order.get('order_id')}</code>\n"
             f"Товар: {html.escape(str(order.get('product')))}\n"
-            f"Цена: {order.get('price')} USDT\n"
+            f"Цена: {money_text(order.get('price'))} USDT\n"
             f"Статус: {html.escape(str(order.get('status')))}\n\n"
         )
 
@@ -541,10 +893,11 @@ def support_start(message):
 @bot.message_handler(func=lambda m: m.text == "Отмена")
 def support_cancel(message):
     support_waiting.discard(message.from_user.id)
+    topup_waiting.discard(message.from_user.id)
 
     bot.send_message(
         message.chat.id,
-        "Поддержка закрыта.",
+        "Действие отменено.",
         reply_markup=main_menu(message.from_user.id)
     )
 
@@ -582,6 +935,13 @@ def support_message(message):
 
 def admin_panel(chat_id):
     keyboard = types.InlineKeyboardMarkup()
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "💰 Управление балансами",
+            callback_data="admin_balances"
+        )
+    )
 
     keyboard.add(
         types.InlineKeyboardButton(
@@ -632,6 +992,93 @@ def admin_command(message):
 def admin_button(message):
     if is_admin(message.from_user.id):
         admin_panel(message.chat.id)
+
+
+# ==================================================
+# УПРАВЛЕНИЕ БАЛАНСАМИ
+# ==================================================
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_balances")
+def admin_balances(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа.")
+        return
+
+    bot.answer_callback_query(call.id)
+
+    keyboard = types.InlineKeyboardMarkup()
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "➕ Начислить / списать",
+            callback_data="balance_adjust"
+        )
+    )
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "👤 Посмотреть баланс",
+            callback_data="balance_lookup"
+        )
+    )
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "⬅️ В админ-панель",
+            callback_data="admin_back"
+        )
+    )
+
+    bot.send_message(
+        ADMIN_ID,
+        "💰 <b>Управление балансами</b>\n\n"
+        "Здесь можно вручную начислять и списывать USDT.",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "balance_adjust")
+def balance_adjust_start(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа.")
+        return
+
+    bot.answer_callback_query(call.id)
+
+    admin_states[ADMIN_ID] = {
+        "action": "balance_adjust"
+    }
+
+    bot.send_message(
+        ADMIN_ID,
+        "💰 <b>Изменение баланса</b>\n\n"
+        "Отправь Telegram ID и сумму через символ |.\n\n"
+        "Примеры:\n"
+        "<code>123456789 | 25</code> — начислить 25 USDT\n"
+        "<code>123456789 | -5</code> — списать 5 USDT\n\n"
+        "Для отмены: /cancel",
+        parse_mode="HTML"
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "balance_lookup")
+def balance_lookup_start(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа.")
+        return
+
+    bot.answer_callback_query(call.id)
+
+    admin_states[ADMIN_ID] = {
+        "action": "balance_lookup"
+    }
+
+    bot.send_message(
+        ADMIN_ID,
+        "👤 Отправь Telegram ID покупателя.\n\n"
+        "Для отмены: /cancel"
+    )
 
 
 # ==================================================
@@ -724,10 +1171,11 @@ def manage_one_product(call):
         )
     )
 
-    if product["active"]:
-        toggle_text = "🔴 Скрыть товар"
-    else:
-        toggle_text = "🟢 Показать товар"
+    toggle_text = (
+        "🔴 Скрыть товар"
+        if product["active"]
+        else "🟢 Показать товар"
+    )
 
     keyboard.add(
         types.InlineKeyboardButton(
@@ -753,7 +1201,7 @@ def manage_one_product(call):
     bot.send_message(
         ADMIN_ID,
         f"🛍 <b>{html.escape(product['name'])}</b>\n\n"
-        f"Цена: {product['price']} USDT\n"
+        f"Цена: {money_text(product['price'])} USDT\n"
         f"Статус: {status}\n"
         f"Описание: {html.escape(product.get('description') or '')}",
         parse_mode="HTML",
@@ -889,14 +1337,12 @@ def start_add_product(call):
     bot.send_message(
         ADMIN_ID,
         "➕ <b>Добавление товара</b>\n\n"
-        "Отправь данные в одном сообщении в таком формате:\n\n"
+        "Отправь данные в одном сообщении:\n\n"
         "<code>games | Название товара | 10 | Описание товара</code>\n\n"
         "Категории:\n"
         "gifts — подарочные карты\n"
         "games — игры\n"
         "subs — подписки\n\n"
-        "Пример:\n"
-        "<code>games | Новая игра | 12 | Официальный ключ игры</code>\n\n"
         "Для отмены напиши /cancel",
         parse_mode="HTML"
     )
@@ -932,14 +1378,131 @@ def process_admin_action(message):
 
     action = state["action"]
 
-    if action == "price":
+    # ----------------------------------------------
+    # ИЗМЕНЕНИЕ БАЛАНСА
+    # ----------------------------------------------
+
+    if action == "balance_adjust":
+        parts = message.text.split("|")
+
+        if len(parts) != 2:
+            bot.send_message(
+                ADMIN_ID,
+                "❌ Формат: Telegram ID | сумма\n"
+                "Например: 123456789 | 25"
+            )
+            return
+
         try:
-            price = float(message.text.replace(",", "."))
+            target_id = int(parts[0].strip())
+            amount = Decimal(
+                parts[1].strip().replace(",", ".")
+            ).quantize(Decimal("0.01"))
+
+            if target_id <= 0 or amount == 0:
+                raise ValueError
+
+        except (ValueError, InvalidOperation):
+            bot.send_message(
+                ADMIN_ID,
+                "❌ Проверь Telegram ID и сумму."
+            )
+            return
+
+        try:
+            result = db.rpc(
+                "admin_adjust_balance",
+                {
+                    "p_user_id": target_id,
+                    "p_amount": str(amount),
+                    "p_admin_id": ADMIN_ID,
+                    "p_description": "Ручная корректировка администратором"
+                }
+            ).execute()
+
+            new_balance = money(result.data)
+
+            admin_states.pop(ADMIN_ID, None)
+
+            bot.send_message(
+                ADMIN_ID,
+                "✅ <b>Баланс изменён!</b>\n\n"
+                f"Покупатель: <code>{target_id}</code>\n"
+                f"Операция: {amount:+.2f} USDT\n"
+                f"Новый баланс: <b>{new_balance:.2f} USDT</b>",
+                parse_mode="HTML"
+            )
+
+            notify_user(
+                target_id,
+                "💰 <b>Изменение баланса</b>\n\n"
+                f"Операция: <b>{amount:+.2f} USDT</b>\n"
+                f"Новый баланс: <b>{new_balance:.2f} USDT</b>"
+            )
+
+        except Exception as error:
+            print("Ошибка изменения баланса:", error)
+
+            bot.send_message(
+                ADMIN_ID,
+                "❌ Не удалось изменить баланс.\n\n"
+                "Проверь, существует ли покупатель и "
+                "достаточно ли средств для списания."
+            )
+
+    # ----------------------------------------------
+    # ПРОСМОТР БАЛАНСА
+    # ----------------------------------------------
+
+    elif action == "balance_lookup":
+        try:
+            target_id = int(message.text.strip())
+
+            if target_id <= 0:
+                raise ValueError
+
+        except ValueError:
+            bot.send_message(
+                ADMIN_ID,
+                "❌ Введи корректный Telegram ID."
+            )
+            return
+
+        user = get_user_record(target_id)
+
+        if not user:
+            bot.send_message(
+                ADMIN_ID,
+                "Покупатель не найден."
+            )
+            return
+
+        admin_states.pop(ADMIN_ID, None)
+
+        bot.send_message(
+            ADMIN_ID,
+            "👤 <b>Информация о покупателе</b>\n\n"
+            f"ID: <code>{target_id}</code>\n"
+            f"Имя: {html.escape(user.get('first_name') or '')}\n"
+            f"Баланс: <b>{money_text(user.get('balance', 0))} USDT</b>\n"
+            f"Покупок: <b>{user.get('purchased_count', 0)}</b>",
+            parse_mode="HTML"
+        )
+
+    # ----------------------------------------------
+    # ИЗМЕНЕНИЕ ЦЕНЫ
+    # ----------------------------------------------
+
+    elif action == "price":
+        try:
+            price = Decimal(
+                message.text.replace(",", ".").strip()
+            )
 
             if price <= 0:
                 raise ValueError
 
-        except ValueError:
+        except (ValueError, InvalidOperation):
             bot.send_message(
                 ADMIN_ID,
                 "❌ Введи положительную цену, например 12.50"
@@ -953,7 +1516,7 @@ def process_admin_action(message):
 
             bot.send_message(
                 ADMIN_ID,
-                f"✅ Новая цена сохранена: {price} USDT"
+                f"✅ Новая цена сохранена: {price:.2f} USDT"
             )
         else:
             bot.send_message(
@@ -961,8 +1524,15 @@ def process_admin_action(message):
                 "Не удалось изменить цену."
             )
 
+    # ----------------------------------------------
+    # ДОБАВЛЕНИЕ ТОВАРА
+    # ----------------------------------------------
+
     elif action == "add_product":
-        parts = [part.strip() for part in message.text.split("|", 3)]
+        parts = [
+            part.strip()
+            for part in message.text.split("|", 3)
+        ]
 
         if len(parts) != 4:
             bot.send_message(
@@ -989,12 +1559,14 @@ def process_admin_action(message):
             return
 
         try:
-            price = float(price_text.replace(",", "."))
+            price = Decimal(
+                price_text.replace(",", ".")
+            )
 
             if price <= 0:
                 raise ValueError
 
-        except ValueError:
+        except (ValueError, InvalidOperation):
             bot.send_message(
                 ADMIN_ID,
                 "❌ Цена должна быть положительным числом."
@@ -1016,7 +1588,7 @@ def process_admin_action(message):
                 ADMIN_ID,
                 f"✅ Товар добавлен!\n\n"
                 f"{name}\n"
-                f"Цена: {price} USDT"
+                f"Цена: {price:.2f} USDT"
             )
 
             show_manage_products(ADMIN_ID)
@@ -1055,15 +1627,18 @@ def admin_orders(call):
         for order in orders[-20:]:
             bot.send_message(
                 ADMIN_ID,
-                f"📋 Заказ: {order.get('order_id')}\n"
-                f"Покупатель: {order.get('user_id')}\n"
-                f"Товар: {order.get('product')}\n"
-                f"Цена: {order.get('price')} USDT\n"
-                f"Статус: {order.get('status')}"
+                "📋 <b>Заказ</b>\n"
+                f"Номер: <code>{html.escape(str(order.get('order_id')))}</code>\n"
+                f"Покупатель: <code>{order.get('user_id')}</code>\n"
+                f"Товар: {html.escape(str(order.get('product')))}\n"
+                f"Цена: {money_text(order.get('price'))} USDT\n"
+                f"Статус: {html.escape(str(order.get('status')))}",
+                parse_mode="HTML"
             )
 
     except Exception as error:
-        bot.send_message(ADMIN_ID, f"Ошибка: {error}")
+        print("Ошибка списка заказов:", error)
+        bot.send_message(ADMIN_ID, "Не удалось загрузить заказы.")
 
 
 # ==================================================
@@ -1096,6 +1671,8 @@ def admin_users(call):
             text += (
                 f"{html.escape(user.get('first_name') or 'Без имени')} "
                 f"— ID: <code>{user.get('user_id')}</code>\n"
+                f"Баланс: {money_text(user.get('balance', 0))} USDT\n"
+                f"Покупок: {user.get('purchased_count', 0)}\n\n"
             )
 
         bot.send_message(
@@ -1105,7 +1682,8 @@ def admin_users(call):
         )
 
     except Exception as error:
-        bot.send_message(ADMIN_ID, f"Ошибка: {error}")
+        print("Ошибка списка покупателей:", error)
+        bot.send_message(ADMIN_ID, "Не удалось загрузить покупателей.")
 
 
 # ==================================================
@@ -1125,8 +1703,20 @@ def admin_stats(call):
         orders = db.table("orders").select("*").execute().data
 
         total = sum(
-            float(order.get("price") or 0)
-            for order in orders
+            (
+                money(order.get("price", 0))
+                for order in orders
+                if order.get("status") != "Отклонён, средства возвращены"
+            ),
+            Decimal("0.00")
+        )
+
+        total_balance = sum(
+            (
+                money(user.get("balance", 0))
+                for user in users
+            ),
+            Decimal("0.00")
         )
 
         bot.send_message(
@@ -1134,12 +1724,14 @@ def admin_stats(call):
             "📊 <b>Статистика магазина</b>\n\n"
             f"Покупателей: {len(users)}\n"
             f"Заказов: {len(orders)}\n"
-            f"Сумма заказов: {total:.2f} USDT",
+            f"Сумма заказов без возвратов: {total:.2f} USDT\n"
+            f"Баланс всех покупателей: {total_balance:.2f} USDT",
             parse_mode="HTML"
         )
 
     except Exception as error:
-        bot.send_message(ADMIN_ID, f"Ошибка: {error}")
+        print("Ошибка статистики:", error)
+        bot.send_message(ADMIN_ID, "Не удалось загрузить статистику.")
 
 
 # ==================================================
