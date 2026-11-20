@@ -9,16 +9,19 @@ from telebot.types import (
     InlineKeyboardButton
 )
 
-# Настройки
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 bot = telebot.TeleBot(TOKEN)
 
-# Временное хранение заказов и обращений
+# Временное хранение
 orders_db = {}
-waiting_support = set()
-waiting_admin_reply = {}
+
+# Покупатели, у которых открыт диалог
+support_users = set()
+
+# Покупатель, которому сейчас отвечает администратор
+active_admin_chat = None
 
 
 # =========================
@@ -45,8 +48,7 @@ def start(message):
 # КАТАЛОГ
 # =========================
 
-@bot.message_handler(func=lambda m: m.text == "🛒 Каталог")
-def catalog(message):
+def catalog_keyboard():
     keyboard = InlineKeyboardMarkup()
 
     keyboard.add(
@@ -70,16 +72,17 @@ def catalog(message):
         )
     )
 
+    return keyboard
+
+
+@bot.message_handler(func=lambda m: m.text == "🛒 Каталог")
+def catalog(message):
     bot.send_message(
         message.chat.id,
         "🛍 КАТАЛОГ МАГАЗИНА\n\nВыберите категорию:",
-        reply_markup=keyboard
+        reply_markup=catalog_keyboard()
     )
 
-
-# =========================
-# КАТЕГОРИИ
-# =========================
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("cat_"))
 def show_category(call):
@@ -94,6 +97,7 @@ def show_category(call):
                 callback_data="buy_steam"
             )
         )
+
         text = (
             "🎁 ПОДАРОЧНЫЕ КАРТЫ\n\n"
             "Steam Gift Card\n"
@@ -122,41 +126,14 @@ def show_category(call):
     )
 
 
-# =========================
-# ВОЗВРАТ В КАТАЛОГ
-# =========================
-
 @bot.callback_query_handler(func=lambda c: c.data == "back_catalog")
 def back_catalog(call):
     bot.answer_callback_query(call.id)
 
-    keyboard = InlineKeyboardMarkup()
-
-    keyboard.add(
-        InlineKeyboardButton(
-            "🎁 Подарочные карты",
-            callback_data="cat_gifts"
-        )
-    )
-
-    keyboard.add(
-        InlineKeyboardButton(
-            "🎮 Ключи игр",
-            callback_data="cat_games"
-        )
-    )
-
-    keyboard.add(
-        InlineKeyboardButton(
-            "⭐ Подписки",
-            callback_data="cat_subs"
-        )
-    )
-
     bot.send_message(
         call.message.chat.id,
         "🛍 ВЫБЕРИТЕ КАТЕГОРИЮ:",
-        reply_markup=keyboard
+        reply_markup=catalog_keyboard()
     )
 
 
@@ -185,8 +162,8 @@ def buy(call):
         f"✅ Заказ №{order_id} создан!\n\n"
         "🎁 Steam Gift Card\n"
         "💰 Цена: 10 USDT\n"
-        "📌 Статус: ожидает подтверждения.\n\n"
-        "⚠️ Демонстрационный заказ. Оплата и выдача товара не подключены."
+        "📌 Ожидает подтверждения.\n\n"
+        "⚠️ Демонстрационный заказ. Оплата не подключена."
     )
 
     keyboard = InlineKeyboardMarkup()
@@ -211,8 +188,7 @@ def buy(call):
         f"👤 Покупатель: @{username}\n"
         f"🆔 ID: {call.from_user.id}\n"
         "🎁 Steam Gift Card\n"
-        "💰 10 USDT\n"
-        "📌 Ожидает решения.",
+        "💰 10 USDT",
         reply_markup=keyboard
     )
 
@@ -269,7 +245,7 @@ def manage_order(call):
 
 
 # =========================
-# СПИСОК ЗАКАЗОВ АДМИНИСТРАТОРА
+# СПИСОК ЗАКАЗОВ
 # =========================
 
 @bot.message_handler(commands=['orders'])
@@ -321,7 +297,7 @@ def my_orders(message):
     for order_id, order in user_orders:
         text += (
             f"№{order_id}\n"
-            f"Товар: {order['product']}\n"
+            f"{order['product']}\n"
             f"Цена: {order['price']}\n"
             f"Статус: {order['status']}\n\n"
         )
@@ -330,30 +306,32 @@ def my_orders(message):
 
 
 # =========================
-# ПОДДЕРЖКА ПОКУПАТЕЛЕЙ
+# НАЧАЛО ПОДДЕРЖКИ
 # =========================
 
 @bot.message_handler(func=lambda m: m.text == "💬 Поддержка")
 def support(message):
 
-    waiting_support.add(message.from_user.id)
+    support_users.add(message.from_user.id)
 
     bot.send_message(
         message.chat.id,
         "💬 ПОДДЕРЖКА\n\n"
-        "Напишите свой вопрос одним сообщением.\n"
-        "Я передам его администратору."
+        "Напишите сообщение. Администратор скоро ответит.\n"
+        "Можете отправлять несколько сообщений подряд."
     )
 
 
 # =========================
-# ОТВЕТ АДМИНИСТРАТОРА
+# КНОПКИ АДМИНИСТРАТОРА
 # =========================
 
 @bot.callback_query_handler(
     func=lambda c: c.data.startswith("support_reply:")
 )
-def support_reply_button(call):
+def support_reply(call):
+
+    global active_admin_chat
 
     if call.from_user.id != ADMIN_ID:
         bot.answer_callback_query(
@@ -365,40 +343,100 @@ def support_reply_button(call):
 
     user_id = int(call.data.split(":", 1)[1])
 
-    waiting_admin_reply[ADMIN_ID] = user_id
+    if user_id not in support_users:
+        bot.answer_callback_query(
+            call.id,
+            "Диалог уже закрыт."
+        )
+        return
 
-    bot.answer_callback_query(call.id)
+    active_admin_chat = user_id
+
+    bot.answer_callback_query(
+        call.id,
+        "Вы можете отвечать."
+    )
 
     bot.send_message(
         ADMIN_ID,
-        f"✍️ Напишите ответ покупателю с ID {user_id}."
+        f"✍️ Вы отвечаете покупателю {user_id}.\n\n"
+        "Отправьте сообщение."
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("support_close:")
+)
+def support_close(call):
+
+    global active_admin_chat
+
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(
+            call.id,
+            "⛔ Нет доступа.",
+            show_alert=True
+        )
+        return
+
+    user_id = int(call.data.split(":", 1)[1])
+
+    support_users.discard(user_id)
+
+    if active_admin_chat == user_id:
+        active_admin_chat = None
+
+    bot.answer_callback_query(
+        call.id,
+        "Диалог завершён."
+    )
+
+    bot.send_message(
+        user_id,
+        "🔒 Диалог с поддержкой завершён.\n"
+        "Если понадобится помощь, нажмите «💬 Поддержка»."
+    )
+
+    bot.send_message(
+        ADMIN_ID,
+        f"✅ Диалог с покупателем {user_id} завершён."
     )
 
 
 # =========================
-# ОБРАБОТКА СООБЩЕНИЙ
+# ОБРАБОТКА ВСЕХ СООБЩЕНИЙ
 # =========================
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
 
+    global active_admin_chat
+
     user_id = message.from_user.id
     text = message.text
 
-    # Администратор отвечает покупателю
-    if user_id == ADMIN_ID and ADMIN_ID in waiting_admin_reply:
+    # Администратор пишет покупателю
+    if user_id == ADMIN_ID and active_admin_chat is not None:
 
-        target_id = waiting_admin_reply.pop(ADMIN_ID)
+        target_id = active_admin_chat
+
+        if target_id not in support_users:
+            active_admin_chat = None
+            bot.send_message(
+                ADMIN_ID,
+                "Диалог уже закрыт."
+            )
+            return
 
         try:
             bot.send_message(
                 target_id,
-                "💬 ОТВЕТ ПОДДЕРЖКИ\n\n" + text
+                "💬 ПОДДЕРЖКА:\n\n" + text
             )
 
             bot.send_message(
                 ADMIN_ID,
-                "✅ Ответ отправлен покупателю."
+                "✅ Сообщение отправлено."
             )
 
         except Exception:
@@ -409,10 +447,8 @@ def handle_text(message):
 
         return
 
-    # Покупатель отправляет вопрос
-    if user_id in waiting_support:
-
-        waiting_support.discard(user_id)
+    # Покупатель пишет поддержке
+    if user_id in support_users:
 
         username = message.from_user.username or "без username"
 
@@ -425,10 +461,17 @@ def handle_text(message):
             )
         )
 
+        keyboard.add(
+            InlineKeyboardButton(
+                "🔒 Завершить диалог",
+                callback_data=f"support_close:{user_id}"
+            )
+        )
+
         bot.send_message(
             ADMIN_ID,
-            f"💬 НОВОЕ ОБРАЩЕНИЕ В ПОДДЕРЖКУ\n\n"
-            f"👤 Покупатель: @{username}\n"
+            f"💬 СООБЩЕНИЕ ОТ ПОКУПАТЕЛЯ\n\n"
+            f"👤 @{username}\n"
             f"🆔 ID: {user_id}\n\n"
             f"Сообщение:\n{text}",
             reply_markup=keyboard
@@ -436,21 +479,19 @@ def handle_text(message):
 
         bot.send_message(
             message.chat.id,
-            "✅ Ваше сообщение отправлено администратору.\n"
-            "Ожидайте ответа."
+            "✅ Сообщение передано администратору."
         )
 
         return
 
-    # Обычное сообщение
     bot.send_message(
         message.chat.id,
-        "Выберите раздел в меню или нажмите «💬 Поддержка»."
+        "Выберите раздел в меню."
     )
 
 
 # =========================
-# ЗАПУСК БОТА
+# ЗАПУСК
 # =========================
 
 bot.infinity_polling()
