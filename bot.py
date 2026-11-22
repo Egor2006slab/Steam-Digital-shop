@@ -38,7 +38,7 @@ db = create_client(SUPABASE_URL, SUPABASE_KEY)
 states = {}
 started_users = set()
 
-# ID только основного редактируемого экрана.
+# Храним ID только основного экрана интерфейса.
 ui_messages = {}
 
 
@@ -97,10 +97,6 @@ def delete_user_message(message):
 
 
 def clear_screen(chat_id):
-    """
-    Удаляет только зарегистрированный экран интерфейса.
-    Важные сообщения сюда не попадают.
-    """
     message_id = ui_messages.pop(chat_id, None)
 
     if message_id:
@@ -109,8 +105,8 @@ def clear_screen(chat_id):
 
 def show_screen(chat_id, text, reply_markup=None, parse_mode="HTML"):
     """
-    Обновляет один и тот же экран.
-    Если его нельзя отредактировать, отправляет новый.
+    Обычные разделы редактируют существующий экран.
+    Если редактирование невозможно, создаётся новый экран.
     """
     old_id = ui_messages.get(chat_id)
 
@@ -124,9 +120,7 @@ def show_screen(chat_id, text, reply_markup=None, parse_mode="HTML"):
                 parse_mode=parse_mode
             )
             return old_id
-
         except Exception:
-            # Например, Telegram не позволяет редактировать сообщение.
             pass
 
     sent = bot.send_message(
@@ -137,16 +131,25 @@ def show_screen(chat_id, text, reply_markup=None, parse_mode="HTML"):
     )
 
     ui_messages[chat_id] = sent.message_id
+
+    if old_id:
+        safe_delete(chat_id, old_id)
+
     return sent.message_id
 
 
 def edit_screen(call, text, reply_markup=None):
     """
-    Редактирует основной экран, а не произвольное сообщение,
-    с которого была нажата кнопка.
+    Редактирует только основной экран интерфейса.
+    Не редактирует важные сообщения с реквизитами или кодами.
     """
     chat_id = call.message.chat.id
-    show_screen(chat_id, text, reply_markup)
+
+    show_screen(
+        chat_id,
+        text,
+        reply_markup=reply_markup
+    )
 
 
 def main_menu(user_id):
@@ -204,9 +207,33 @@ def back_home_keyboard(back_callback=None):
     return markup
 
 
-def send_home(chat_id, text="Главное меню"):
+def send_home(chat_id, text="Главное меню", new_message=False):
+    """
+    new_message=False — обновляет существующее меню.
+    new_message=True — отправляет новое меню последним сообщением.
+    """
     clear_state(chat_id)
-    show_screen(
+
+    if new_message:
+        old_id = ui_messages.get(chat_id)
+
+        sent = bot.send_message(
+            chat_id,
+            text,
+            reply_markup=main_menu(chat_id),
+            parse_mode="HTML"
+        )
+
+        ui_messages[chat_id] = sent.message_id
+
+        # Удаляем только старый экран интерфейса.
+        # Реквизиты, коды и другие важные сообщения не затрагиваются.
+        if old_id and old_id != sent.message_id:
+            safe_delete(chat_id, old_id)
+
+        return sent.message_id
+
+    return show_screen(
         chat_id,
         text,
         reply_markup=main_menu(chat_id)
@@ -424,7 +451,8 @@ def start(message):
 
     send_home(
         message.chat.id,
-        "👋 Добро пожаловать в магазин цифровых товаров!"
+        "👋 Добро пожаловать в магазин цифровых товаров!",
+        new_message=True
     )
 
 
@@ -615,12 +643,18 @@ def buy_product(call):
 
         bot.answer_callback_query(call.id, "Заказ создан.")
 
-        # Реквизиты — отдельное важное сообщение.
-        # Оно не становится основным экраном.
+        # Реквизиты остаются отдельным важным сообщением.
         bot.send_message(
             call.message.chat.id,
             text,
             reply_markup=payment_keyboard(payment_ref)
+        )
+
+        # Главное меню отправляется новым сообщением после реквизитов.
+        send_home(
+            call.message.chat.id,
+            "🏠 Главное меню",
+            new_message=True
         )
 
     except Exception:
@@ -859,6 +893,14 @@ def notify_payment_result(payment, approved, secret_code=None):
             "❌ Оплата отклонена администратором.\n"
             "Если вы считаете, что произошла ошибка, обратитесь в поддержку."
         )
+
+    # После результата покупки отправляем новое главное меню.
+    # Оно становится последним сообщением в чате.
+    send_home(
+        user_id,
+        "🏠 Главное меню",
+        new_message=True
+    )
 
 
 def get_secret_after_approval(payment):
@@ -2006,6 +2048,7 @@ def admin_resale_mark_sold(call):
         seller_id = int(good["seller_id"])
 
         try:
+            # Уведомление продавцу — отдельное сообщение.
             bot.send_message(
                 seller_id,
                 "✅ <b>Ваш товар продан!</b>\n\n"
@@ -2352,8 +2395,7 @@ def admin_payments(call):
         )
         return
 
-    # Карточки платежей остаются отдельными сообщениями,
-    # чтобы кнопки одобрения и отклонения были доступны.
+    # Карточки платежей отправляются отдельно.
     for payment in payments:
         text = (
             "<b>💳 Платёж ожидает проверки</b>\n\n"
