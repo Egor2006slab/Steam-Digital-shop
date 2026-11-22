@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 
 import telebot
 from telebot import types
+from telebot.apihelper import ApiTelegramException
 from supabase import create_client
 
 
@@ -36,10 +37,11 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 db = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 states = {}
-
-# Пользователи, которые запустили бота командой /start.
-# После перезапуска бота список очищается.
 started_users = set()
+
+# Здесь хранятся только временные экраны интерфейса.
+# Важные уведомления и секретные коды сюда не записываются.
+ui_messages = {}
 
 
 # =========================================================
@@ -85,6 +87,68 @@ def clear_state(user_id):
     states.pop(user_id, None)
 
 
+def safe_delete(chat_id, message_id):
+    try:
+        bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
+def delete_user_message(message):
+    safe_delete(message.chat.id, message.message_id)
+
+
+def clear_screen(chat_id):
+    old_ids = ui_messages.pop(chat_id, [])
+
+    for message_id in old_ids:
+        safe_delete(chat_id, message_id)
+
+
+def show_screen(chat_id, text, reply_markup=None, parse_mode="HTML"):
+    """
+    Отправляет новый экран и удаляет предыдущие временные экраны.
+    Не используется для важных уведомлений и секретных кодов.
+    """
+    clear_screen(chat_id)
+
+    sent = bot.send_message(
+        chat_id,
+        text,
+        reply_markup=reply_markup,
+        parse_mode=parse_mode
+    )
+
+    ui_messages[chat_id] = [sent.message_id]
+    return sent
+
+
+def edit_screen(call, text, reply_markup=None):
+    """
+    Обновляет текущий экран по нажатию inline-кнопки.
+    Если Telegram не позволяет редактирование, отправляет новый экран.
+    """
+    try:
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
+
+        ui_messages[call.message.chat.id] = [
+            call.message.message_id
+        ]
+
+    except Exception:
+        show_screen(
+            call.message.chat.id,
+            text,
+            reply_markup=reply_markup
+        )
+
+
 def main_menu(user_id):
     markup = types.ReplyKeyboardMarkup(
         resize_keyboard=True,
@@ -101,8 +165,34 @@ def main_menu(user_id):
     return markup
 
 
+def back_home_keyboard(back_callback=None):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+
+    buttons = []
+
+    if back_callback:
+        buttons.append(
+            types.InlineKeyboardButton(
+                "⬅️ Назад",
+                callback_data=back_callback
+            )
+        )
+
+    buttons.append(
+        types.InlineKeyboardButton(
+            "🏠 Главное меню",
+            callback_data="go_home"
+        )
+    )
+
+    markup.row(*buttons)
+    return markup
+
+
 def send_home(chat_id, text="Главное меню"):
     clear_state(chat_id)
+    clear_screen(chat_id)
+
     bot.send_message(
         chat_id,
         text,
@@ -167,10 +257,17 @@ def get_listing_for_good(good_id):
 
 def payment_keyboard(payment_ref):
     markup = types.InlineKeyboardMarkup()
+
     markup.add(types.InlineKeyboardButton(
         "✅ Я оплатил",
         callback_data=f"report:{payment_ref}"
     ))
+
+    markup.add(types.InlineKeyboardButton(
+        "🏠 Главное меню",
+        callback_data="go_home"
+    ))
+
     return markup
 
 
@@ -178,6 +275,68 @@ def format_date(value):
     if not value:
         return "Не указана"
     return str(value).replace("T", " ").split(".")[0]
+
+
+def catalog_keyboard():
+    result = (
+        db.table("products")
+        .select("product_id,name,price")
+        .eq("active", True)
+        .order("name")
+        .execute()
+    )
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    for product in result.data or []:
+        markup.add(types.InlineKeyboardButton(
+            f"{product['name']} — {money(product['price'])} USDT",
+            callback_data=f"product:{product['product_id']}"
+        ))
+
+    markup.add(types.InlineKeyboardButton(
+        "🏠 Главное меню",
+        callback_data="go_home"
+    ))
+
+    return markup
+
+
+def show_catalog(chat_id):
+    show_screen(
+        chat_id,
+        "<b>🛍 Каталог товаров</b>\n\nВыберите товар:",
+        reply_markup=catalog_keyboard()
+    )
+
+
+# =========================================================
+# ОБЩИЕ CALLBACK-КНОПКИ
+# =========================================================
+
+@bot.callback_query_handler(func=lambda c: c.data == "go_home")
+def callback_home(call):
+    bot.answer_callback_query(call.id)
+    clear_state(call.from_user.id)
+    clear_screen(call.message.chat.id)
+
+    bot.send_message(
+        call.message.chat.id,
+        "Главное меню:",
+        reply_markup=main_menu(call.from_user.id)
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "cancel_action")
+def callback_cancel_action(call):
+    bot.answer_callback_query(call.id, "Действие отменено.")
+    clear_state(call.from_user.id)
+
+    show_screen(
+        call.message.chat.id,
+        "Действие отменено.",
+        reply_markup=back_home_keyboard()
+    )
 
 
 # =========================================================
@@ -202,8 +361,6 @@ def start(message):
     )
 
 
-# Все текстовые сообщения до /start перехватываются здесь.
-# Обработчик зарегистрирован раньше обработчиков магазина.
 @bot.message_handler(
     content_types=["text"],
     func=lambda m: m.from_user.id not in started_users
@@ -216,35 +373,41 @@ def require_start(message):
     )
 
 
-# Блокируем inline-кнопки, если пользователь ещё не запускал бота.
 @bot.callback_query_handler(
     func=lambda c: c.from_user.id not in started_users
 )
 def require_start_callback(call):
     bot.answer_callback_query(
         call.id,
-        "Сначала запустите магазин командой /start.",
+        "Сначала запустите бота командой /start.",
         show_alert=True
     )
 
 
 @bot.message_handler(commands=["help"])
 def help_command(message):
-    bot.send_message(
+    show_screen(
         message.chat.id,
         "<b>ℹ️ Помощь по магазину</b>\n\n"
         "/start — открыть магазин\n"
         "/menu — открыть главное меню\n"
         "/help — показать эту справку\n"
         "/cancel — отменить текущее действие\n\n"
-        "Для покупки выберите товар в каталоге и следуйте инструкциям."
+        "Для покупки выберите товар в каталоге и следуйте инструкциям.",
+        reply_markup=back_home_keyboard()
     )
 
 
 @bot.message_handler(commands=["cancel"])
 def cancel(message):
     clear_state(message.from_user.id)
-    send_home(message.chat.id, "Действие отменено.")
+    delete_user_message(message)
+
+    show_screen(
+        message.chat.id,
+        "Действие отменено.",
+        reply_markup=back_home_keyboard()
+    )
 
 
 @bot.message_handler(func=lambda m: m.text == "👤 Профиль")
@@ -262,7 +425,11 @@ def profile(message):
         "Все цены магазина указаны в USDT."
     )
 
-    bot.send_message(message.chat.id, text)
+    show_screen(
+        message.chat.id,
+        text,
+        reply_markup=back_home_keyboard()
+    )
 
 
 # =========================================================
@@ -272,28 +439,7 @@ def profile(message):
 @bot.message_handler(func=lambda m: m.text == "🛍 Каталог")
 def catalog(message):
     save_user(message.from_user)
-
-    result = (
-        db.table("products")
-        .select("product_id,name,price")
-        .eq("active", True)
-        .order("name")
-        .execute()
-    )
-
-    markup = types.InlineKeyboardMarkup(row_width=1)
-
-    for product in result.data or []:
-        markup.add(types.InlineKeyboardButton(
-            f"{product['name']} — {money(product['price'])} USDT",
-            callback_data=f"product:{product['product_id']}"
-        ))
-
-    bot.send_message(
-        message.chat.id,
-        "<b>🛍 Каталог товаров</b>\n\nВыберите товар:",
-        reply_markup=markup
-    )
+    show_catalog(message.chat.id)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("product:"))
@@ -322,39 +468,23 @@ def product_card(call):
         "⬅️ В каталог",
         callback_data="back_catalog"
     ))
+    markup.add(types.InlineKeyboardButton(
+        "🏠 Главное меню",
+        callback_data="go_home"
+    ))
 
     bot.answer_callback_query(call.id)
-    bot.send_message(
-        call.message.chat.id,
-        text,
-        reply_markup=markup
-    )
+    edit_screen(call, text, markup)
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "back_catalog")
 def back_catalog(call):
     bot.answer_callback_query(call.id)
 
-    result = (
-        db.table("products")
-        .select("product_id,name,price")
-        .eq("active", True)
-        .order("name")
-        .execute()
-    )
-
-    markup = types.InlineKeyboardMarkup(row_width=1)
-
-    for product in result.data or []:
-        markup.add(types.InlineKeyboardButton(
-            f"{product['name']} — {money(product['price'])} USDT",
-            callback_data=f"product:{product['product_id']}"
-        ))
-
-    bot.send_message(
-        call.message.chat.id,
+    edit_screen(
+        call,
         "<b>🛍 Каталог товаров</b>\n\nВыберите товар:",
-        reply_markup=markup
+        catalog_keyboard()
     )
 
 
@@ -406,6 +536,11 @@ def buy_product(call):
         )
 
         bot.answer_callback_query(call.id, "Заказ создан.")
+
+        # Это важное сообщение с реквизитами оплаты.
+        # Оно не удаляется при переходе между экранами.
+        clear_screen(call.message.chat.id)
+
         bot.send_message(
             call.message.chat.id,
             text,
@@ -418,10 +553,7 @@ def buy_product(call):
             call.id,
             "Ошибка создания заказа. Попробуйте позже.",
             show_alert=True
-        )
-
-
-# =========================================================
+        )# =========================================================
 # СООБЩЕНИЕ ОБ ОПЛАТЕ
 # =========================================================
 
@@ -475,11 +607,16 @@ def report_payment_start(call):
         "Пропустить хеш транзакции",
         callback_data=f"nohash:{payment_ref}"
     ))
+    markup.add(types.InlineKeyboardButton(
+        "❌ Отменить",
+        callback_data="cancel_action"
+    ))
 
     bot.answer_callback_query(call.id)
-    bot.send_message(
+
+    show_screen(
         call.message.chat.id,
-        "Отправьте хеш транзакции (TXID) сообщением.\n"
+        "Отправьте хеш транзакции (TXID) сообщением.\n\n"
         "Если не хотите его указывать, нажмите кнопку ниже.",
         reply_markup=markup
     )
@@ -488,8 +625,9 @@ def report_payment_start(call):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("nohash:"))
 def report_without_hash(call):
     payment_ref = call.data.split(":", 1)[1]
-    submit_payment_report(call.from_user.id, payment_ref, None)
+
     bot.answer_callback_query(call.id)
+    submit_payment_report(call.from_user.id, payment_ref, None)
 
 
 def submit_payment_report(user_id, payment_ref, tx_hash):
@@ -505,16 +643,21 @@ def submit_payment_report(user_id, payment_ref, tx_hash):
         or int(payment["user_id"]) != user_id
         or payment["payment_type"] != "purchase"
     ):
-        bot.send_message(user_id, "Платёж не найден.")
         clear_state(user_id)
+        show_screen(
+            user_id,
+            "Платёж не найден.",
+            reply_markup=back_home_keyboard()
+        )
         return
 
     if payment["status"] != "awaiting_payment":
-        bot.send_message(
-            user_id,
-            "Этот платёж уже обработан или срок его оплаты истёк."
-        )
         clear_state(user_id)
+        show_screen(
+            user_id,
+            "Этот платёж уже обработан или срок его оплаты истёк.",
+            reply_markup=back_home_keyboard()
+        )
         return
 
     rpc("report_crypto_payment", {
@@ -525,10 +668,14 @@ def submit_payment_report(user_id, payment_ref, tx_hash):
 
     clear_state(user_id)
 
+    # Уведомление о принятии сообщения — важное, не временный экран.
+    clear_screen(user_id)
+
     bot.send_message(
         user_id,
         "✅ Информация об оплате отправлена администратору.\n"
-        "После проверки вы получите уведомление о результате."
+        "После проверки вы получите уведомление о результате.",
+        reply_markup=main_menu(user_id)
     )
 
     try:
@@ -566,17 +713,26 @@ def receive_tx_hash(message):
     tx_hash = (message.text or "").strip()
 
     if not tx_hash:
-        bot.send_message(
+        delete_user_message(message)
+        show_screen(
             message.chat.id,
-            "Отправьте текстовый TXID или нажмите «Пропустить»."
+            "Отправьте текстовый TXID или нажмите «Пропустить».",
+            reply_markup=back_home_keyboard("cancel_action")
         )
         return
 
     if len(tx_hash) > 200:
-        bot.send_message(message.chat.id, "Слишком длинный TXID.")
+        delete_user_message(message)
+        show_screen(
+            message.chat.id,
+            "Слишком длинный TXID. Отправьте корректный хеш.",
+            reply_markup=back_home_keyboard("cancel_action")
+        )
         return
 
     payment_ref = states[message.from_user.id]["payment_ref"]
+
+    delete_user_message(message)
     submit_payment_report(message.from_user.id, payment_ref, tx_hash)
 
 
@@ -604,7 +760,12 @@ def notify_payment_result(payment, approved, secret_code=None):
                 "Обратитесь в поддержку."
             )
 
-        sent_message = bot.send_message(user_id, text)
+        # Важное сообщение с кодом не удаляем автоматически.
+        sent_message = bot.send_message(
+            user_id,
+            text,
+            reply_markup=main_menu(user_id)
+        )
 
         if secret_code and payment.get("order_id"):
             try:
@@ -628,7 +789,8 @@ def notify_payment_result(payment, approved, secret_code=None):
         bot.send_message(
             user_id,
             "❌ Оплата отклонена администратором.\n"
-            "Если вы считаете, что произошла ошибка, обратитесь в поддержку."
+            "Если вы считаете, что произошла ошибка, обратитесь в поддержку.",
+            reply_markup=main_menu(user_id)
         )
 
 
@@ -705,6 +867,7 @@ def review_payment(call):
         except Exception:
             pass
 
+        # Важное подтверждение администратору.
         bot.send_message(ADMIN_ID, result_text)
 
     except Exception:
@@ -736,7 +899,11 @@ def my_orders(message):
     orders = result.data or []
 
     if not orders:
-        bot.send_message(message.chat.id, "У вас пока нет заказов.")
+        show_screen(
+            message.chat.id,
+            "У вас пока нет заказов.",
+            reply_markup=back_home_keyboard()
+        )
         return
 
     lines = ["<b>📦 Ваши заказы</b>\n"]
@@ -749,7 +916,11 @@ def my_orders(message):
             f"Статус: {esc(order.get('status'))}\n"
         )
 
-    bot.send_message(message.chat.id, "\n".join(lines))
+    show_screen(
+        message.chat.id,
+        "\n".join(lines),
+        reply_markup=back_home_keyboard()
+    )
 
 
 # =========================================================
@@ -771,7 +942,11 @@ def payment_history(message):
     payments = result.data or []
 
     if not payments:
-        bot.send_message(message.chat.id, "История платежей пока пуста.")
+        show_screen(
+            message.chat.id,
+            "История платежей пока пуста.",
+            reply_markup=back_home_keyboard()
+        )
         return
 
     lines = ["<b>💳 История платежей</b>\n"]
@@ -783,10 +958,11 @@ def payment_history(message):
             f"Статус: {esc(payment['status'])}\n"
         )
 
-    bot.send_message(message.chat.id, "\n".join(lines))
-
-
-# =========================================================
+    show_screen(
+        message.chat.id,
+        "\n".join(lines),
+        reply_markup=back_home_keyboard()
+    )# =========================================================
 # ПЕРЕПРОДАЖА
 # =========================================================
 
@@ -803,10 +979,14 @@ def resale_menu(message):
         types.InlineKeyboardButton(
             "📋 Мои объявления",
             callback_data="resale_my"
+        ),
+        types.InlineKeyboardButton(
+            "🏠 Главное меню",
+            callback_data="go_home"
         )
     )
 
-    bot.send_message(
+    show_screen(
         message.chat.id,
         "<b>🔄 Перепродажа</b>\n\n"
         "Здесь можно выставить на перепродажу товар, "
@@ -853,21 +1033,31 @@ def resale_sell_start(call):
             ))
             count += 1
 
+        markup.add(types.InlineKeyboardButton(
+            "⬅️ Назад",
+            callback_data="resale_back"
+        ))
+        markup.add(types.InlineKeyboardButton(
+            "🏠 Главное меню",
+            callback_data="go_home"
+        ))
+
         bot.answer_callback_query(call.id)
 
         if count == 0:
-            bot.send_message(
+            show_screen(
                 call.message.chat.id,
                 "У вас нет доступных заказов для перепродажи.\n\n"
                 "Можно выставить только товар, который был выдан вам ранее "
-                "и ещё не выставлялся на перепродажу."
+                "и ещё не выставлялся на перепродажу.",
+                reply_markup=back_home_keyboard("resale_back")
             )
             return
 
-        bot.send_message(
-            call.message.chat.id,
+        edit_screen(
+            call,
             "Выберите свой заказ, товар из которого хотите выставить:",
-            reply_markup=markup
+            markup
         )
 
     except Exception:
@@ -875,6 +1065,34 @@ def resale_sell_start(call):
         bot.answer_callback_query(
             call.id, "Не удалось загрузить заказы.", show_alert=True
         )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "resale_back")
+def resale_back(call):
+    bot.answer_callback_query(call.id)
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            "➕ Создать закрытое объявление",
+            callback_data="resale_sell"
+        ),
+        types.InlineKeyboardButton(
+            "📋 Мои объявления",
+            callback_data="resale_my"
+        ),
+        types.InlineKeyboardButton(
+            "🏠 Главное меню",
+            callback_data="go_home"
+        )
+    )
+
+    edit_screen(
+        call,
+        "<b>🔄 Перепродажа</b>\n\n"
+        "Здесь можно выставить на перепродажу ранее выданный товар.",
+        markup
+    )
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sell_order:"))
@@ -903,11 +1121,13 @@ def resale_set_price(call):
     }
 
     bot.answer_callback_query(call.id)
-    bot.send_message(
+
+    show_screen(
         call.message.chat.id,
         "Введите желаемую цену перепродажи в USDT.\n\n"
         "Например: <code>25.50</code>\n\n"
-        "Для отмены отправьте /cancel."
+        "Для отмены нажмите кнопку ниже или отправьте /cancel.",
+        reply_markup=back_home_keyboard("cancel_action")
     )
 
 
@@ -932,13 +1152,16 @@ def receive_resale_price(message):
         price = price.quantize(Decimal("0.01"))
 
     except (InvalidOperation, AttributeError, ValueError):
-        bot.send_message(
+        delete_user_message(message)
+        show_screen(
             message.chat.id,
-            "Введите корректную цену, например 25.50."
+            "Введите корректную цену, например 25.50.",
+            reply_markup=back_home_keyboard("cancel_action")
         )
         return
 
     order_id = state.get("order_id")
+    delete_user_message(message)
 
     try:
         order_result = (
@@ -953,9 +1176,10 @@ def receive_resale_price(message):
 
         if not order_result.data:
             clear_state(user_id)
-            bot.send_message(
+            show_screen(
                 message.chat.id,
-                "Заказ не найден или больше не доступен для перепродажи."
+                "Заказ не найден или больше не доступен для перепродажи.",
+                reply_markup=back_home_keyboard()
             )
             return
 
@@ -969,9 +1193,10 @@ def receive_resale_price(message):
 
         if existing.data:
             clear_state(user_id)
-            bot.send_message(
+            show_screen(
                 message.chat.id,
-                "Этот товар уже выставлялся на перепродажу."
+                "Этот товар уже выставлялся на перепродажу.",
+                reply_markup=back_home_keyboard()
             )
             return
 
@@ -985,10 +1210,11 @@ def receive_resale_price(message):
 
         if not row:
             clear_state(user_id)
-            bot.send_message(
+            show_screen(
                 message.chat.id,
                 "Не удалось создать объявление. "
-                "Возможно, перепродажа этого товара запрещена."
+                "Возможно, перепродажа этого товара запрещена.",
+                reply_markup=back_home_keyboard()
             )
             return
 
@@ -1006,26 +1232,29 @@ def receive_resale_price(message):
         good = first_row(good_result.data)
 
         if not good:
-            bot.send_message(
+            show_screen(
                 message.chat.id,
-                "Объявление создано, но не удалось загрузить его сведения."
+                "Объявление создано, но не удалось загрузить его сведения.",
+                reply_markup=back_home_keyboard()
             )
             return
 
         listing = get_listing_for_good(good["id"])
 
         if not listing:
-            bot.send_message(
+            show_screen(
                 message.chat.id,
-                "Объявление создано, но не удалось загрузить его сведения."
+                "Объявление создано, но не удалось загрузить его сведения.",
+                reply_markup=back_home_keyboard()
             )
             return
 
-        bot.send_message(
+        show_screen(
             message.chat.id,
             "✅ <b>Закрытое объявление создано!</b>\n\n"
             "Оно доступно только вам и администратору.\n"
-            "Секретный код в вашем объявлении не отображается."
+            "Секретный код в вашем объявлении не отображается.",
+            reply_markup=back_home_keyboard()
         )
 
         send_my_resale_detail(message.chat.id, user_id, listing["id"])
@@ -1033,10 +1262,11 @@ def receive_resale_price(message):
     except Exception:
         logging.exception("Ошибка создания объявления")
         clear_state(user_id)
-        bot.send_message(
+        show_screen(
             message.chat.id,
             "Не удалось выставить товар. "
-            "Возможно, он уже выставлен или перепродажа запрещена."
+            "Возможно, он уже выставлен или перепродажа запрещена.",
+            reply_markup=back_home_keyboard()
         )
 
 
@@ -1082,22 +1312,32 @@ def resale_my_listings(call):
             ))
             count += 1
 
+        markup.add(types.InlineKeyboardButton(
+            "⬅️ Назад",
+            callback_data="resale_back"
+        ))
+        markup.add(types.InlineKeyboardButton(
+            "🏠 Главное меню",
+            callback_data="go_home"
+        ))
+
         bot.answer_callback_query(call.id)
 
         if count == 0:
-            bot.send_message(
-                call.message.chat.id,
+            edit_screen(
+                call,
                 "У вас пока нет объявлений.\n\n"
                 "Нажмите «Создать закрытое объявление», "
-                "чтобы выставить ранее купленный товар."
+                "чтобы выставить ранее купленный товар.",
+                back_home_keyboard("resale_back")
             )
             return
 
-        bot.send_message(
-            call.message.chat.id,
+        edit_screen(
+            call,
             "<b>📋 Ваши закрытые объявления</b>\n\n"
             "Выберите объявление, чтобы посмотреть подробности:",
-            reply_markup=markup
+            markup
         )
 
     except Exception:
@@ -1111,13 +1351,21 @@ def send_my_resale_detail(chat_id, user_id, listing_id):
     listing = get_resale_listing(listing_id)
 
     if not listing:
-        bot.send_message(chat_id, "Объявление не найдено.")
+        show_screen(
+            chat_id,
+            "Объявление не найдено.",
+            reply_markup=back_home_keyboard("resale_back")
+        )
         return
 
     good = get_resale_good(listing["good_id"])
 
     if not good or int(good["seller_id"]) != int(user_id):
-        bot.send_message(chat_id, "У вас нет доступа к этому объявлению.")
+        show_screen(
+            chat_id,
+            "У вас нет доступа к этому объявлению.",
+            reply_markup=back_home_keyboard("resale_back")
+        )
         return
 
     product = get_product(good["product_id"])
@@ -1134,9 +1382,10 @@ def send_my_resale_detail(chat_id, user_id, listing_id):
     order = first_row(order_result.data)
 
     if not order:
-        bot.send_message(
+        show_screen(
             chat_id,
-            "Не удалось загрузить сведения об исходном заказе."
+            "Не удалось загрузить сведения об исходном заказе.",
+            reply_markup=back_home_keyboard("resale_back")
         )
         return
 
@@ -1169,7 +1418,11 @@ def send_my_resale_detail(chat_id, user_id, listing_id):
         "🔒 Секретный код скрыт."
     )
 
-    bot.send_message(chat_id, text)
+    show_screen(
+        chat_id,
+        text,
+        reply_markup=back_home_keyboard("resale_my")
+    )
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("myresale:"))
@@ -1199,11 +1452,12 @@ def my_resale_detail(call):
 def support_start(message):
     states[message.from_user.id] = {"action": "support"}
 
-    bot.send_message(
+    show_screen(
         message.chat.id,
         "Напишите сообщение для поддержки. "
-        "Оно будет передано администратору.\n"
-        "Для отмены отправьте /cancel."
+        "Оно будет передано администратору.\n\n"
+        "Для отмены нажмите кнопку ниже или отправьте /cancel.",
+        reply_markup=back_home_keyboard("cancel_action")
     )
 
 
@@ -1216,8 +1470,15 @@ def support_message(message):
     text = message.text or ""
 
     if not text.strip():
-        bot.send_message(message.chat.id, "Отправьте текстовое сообщение.")
+        delete_user_message(message)
+        show_screen(
+            message.chat.id,
+            "Отправьте текстовое сообщение.",
+            reply_markup=back_home_keyboard("cancel_action")
+        )
         return
+
+    delete_user_message(message)
 
     try:
         bot.send_message(
@@ -1232,16 +1493,22 @@ def support_message(message):
         )
 
         clear_state(user_id)
+
+        # Это подтверждение пользователю не удаляется очисткой экранов.
+        clear_screen(user_id)
+
         bot.send_message(
             message.chat.id,
-            "✅ Сообщение передано администратору."
+            "✅ Сообщение передано администратору.",
+            reply_markup=main_menu(user_id)
         )
 
     except Exception:
         logging.exception("Ошибка отправки обращения")
-        bot.send_message(
+        show_screen(
             message.chat.id,
-            "Не удалось отправить сообщение. Попробуйте позже."
+            "Не удалось отправить сообщение. Попробуйте позже.",
+            reply_markup=back_home_keyboard()
         )
 
 
@@ -1260,10 +1527,13 @@ def support_reply(message):
         user_id = int(parts[1])
         answer = parts[2]
 
+        # Ответ поддержки — важное сообщение, не временный экран.
         bot.send_message(
             user_id,
-            "💬 <b>Ответ поддержки</b>\n\n" + esc(answer)
+            "💬 <b>Ответ поддержки</b>\n\n" + esc(answer),
+            reply_markup=main_menu(user_id)
         )
+
         bot.reply_to(message, "Ответ отправлен.")
 
     except Exception:
@@ -1292,10 +1562,14 @@ def admin_panel(message):
         types.InlineKeyboardButton(
             "🔄 Все объявления перепродажи",
             callback_data="admin_resale"
+        ),
+        types.InlineKeyboardButton(
+            "🏠 Главное меню",
+            callback_data="go_home"
         )
     )
 
-    bot.send_message(
+    show_screen(
         message.chat.id,
         "<b>⚙️ Панель администратора</b>",
         reply_markup=markup
@@ -1345,14 +1619,24 @@ def admin_resale(call):
             ))
             count += 1
 
+        markup.add(types.InlineKeyboardButton(
+            "⬅️ Назад",
+            callback_data="admin_back"
+        ))
+        markup.add(types.InlineKeyboardButton(
+            "🏠 Главное меню",
+            callback_data="go_home"
+        ))
+
         bot.answer_callback_query(call.id)
-        bot.send_message(
-            call.message.chat.id,
+
+        edit_screen(
+            call,
             "<b>🔄 Все объявления перепродажи</b>\n\n"
             f"Всего объявлений: {count}\n\n"
             "🟢 — активно\n"
             "⚫ — продано",
-            reply_markup=markup
+            markup
         )
 
     except Exception:
@@ -1360,6 +1644,37 @@ def admin_resale(call):
         bot.answer_callback_query(
             call.id, "Не удалось загрузить объявления.", show_alert=True
         )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_back")
+def admin_back(call):
+    bot.answer_callback_query(call.id)
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            "📦 Управление товарами",
+            callback_data="admin_products"
+        ),
+        types.InlineKeyboardButton(
+            "💳 Ожидающие оплаты",
+            callback_data="admin_payments"
+        ),
+        types.InlineKeyboardButton(
+            "🔄 Все объявления перепродажи",
+            callback_data="admin_resale"
+        ),
+        types.InlineKeyboardButton(
+            "🏠 Главное меню",
+            callback_data="go_home"
+        )
+    )
+
+    edit_screen(
+        call,
+        "<b>⚙️ Панель администратора</b>",
+        markup
+    )
 
 
 @bot.callback_query_handler(
@@ -1420,7 +1735,9 @@ def admin_resale_item(call):
         )
         category = product.get("category") if product else "Не указана"
         description = product.get("description") if product else ""
-        verification_info = product.get("verification_info") if product else ""
+        verification_info = (
+            product.get("verification_info") if product else ""
+        )
 
         text = (
             "<b>📋 Информация об объявлении</b>\n\n"
@@ -1432,10 +1749,12 @@ def admin_resale_item(call):
             f"Цена покупки: {money(order.get('price'))} USDT\n"
             f"Дата покупки: {esc(format_date(order.get('created_at')))}\n\n"
             f"Описание: {esc(description or 'Не указано')}\n"
-            f"Дополнительные сведения: {esc(verification_info or 'Не указаны')}\n\n"
+            f"Дополнительные сведения: "
+            f"{esc(verification_info or 'Не указаны')}\n\n"
             "<b>Объявление</b>\n"
             f"ID объявления: <code>{listing_id}</code>\n"
-            f"Цена перепродажи: <b>{money(listing.get('asking_price'))} USDT</b>\n"
+            f"Цена перепродажи: "
+            f"<b>{money(listing.get('asking_price'))} USDT</b>\n"
             f"Продавец: {esc(seller_name)}\n"
             f"ID продавца: <code>{good['seller_id']}</code>\n"
             f"Статус объявления: {esc(listing.get('status'))}\n"
@@ -1459,13 +1778,13 @@ def admin_resale_item(call):
             "⬅️ Ко всем объявлениям",
             callback_data="admin_resale"
         ))
+        markup.add(types.InlineKeyboardButton(
+            "🏠 Главное меню",
+            callback_data="go_home"
+        ))
 
         bot.answer_callback_query(call.id)
-        bot.send_message(
-            call.message.chat.id,
-            text,
-            reply_markup=markup
-        )
+        edit_screen(call, text, markup)
 
     except Exception:
         logging.exception("Ошибка просмотра объявления администратором")
@@ -1538,7 +1857,7 @@ def delete_original_secret_message(original_order_id):
 
 
 # =========================================================
-# АДМИН: ОТМЕТИТЬ КАК ПРОДАННЫЙ + УВЕДОМИТЬ ПРОДАВЦА
+# АДМИН: ОТМЕТИТЬ КАК ПРОДАННЫЙ
 # =========================================================
 
 @bot.callback_query_handler(
@@ -1547,9 +1866,7 @@ def delete_original_secret_message(original_order_id):
 def admin_resale_mark_sold(call):
     if not is_admin(call.from_user.id):
         bot.answer_callback_query(
-            call.id,
-            "Нет доступа.",
-            show_alert=True
+            call.id, "Нет доступа.", show_alert=True
         )
         return
 
@@ -1594,7 +1911,6 @@ def admin_resale_mark_sold(call):
             )
             return
 
-        # 1. Отмечаем объявление проданным.
         listing_update = (
             db.table("resale_listings")
             .update({
@@ -1615,7 +1931,6 @@ def admin_resale_mark_sold(call):
             )
             return
 
-        # 2. Отмечаем товар проданным.
         try:
             good_update = (
                 db.table("resale_goods")
@@ -1636,15 +1951,12 @@ def admin_resale_mark_sold(call):
                 "status": "active",
                 "sold_at": None
             }).eq("id", listing_id).execute()
-
             raise
 
-        # 3. Пытаемся удалить сообщение с кодом первоначального покупателя.
         deletion_result = delete_original_secret_message(
             good["original_order_id"]
         )
 
-        # 4. Отправляем уведомление продавцу.
         seller_id = int(good["seller_id"])
 
         try:
@@ -1652,7 +1964,8 @@ def admin_resale_mark_sold(call):
                 seller_id,
                 "✅ <b>Ваш товар продан!</b>\n\n"
                 "Ваше объявление успешно завершено.\n\n"
-                "Спасибо за использование нашего магазина!"
+                "Спасибо за использование нашего магазина!",
+                reply_markup=main_menu(seller_id)
             )
 
             seller_notification = "Уведомление продавцу отправлено."
@@ -1667,25 +1980,22 @@ def admin_resale_mark_sold(call):
                 "Возможно, продавец не запускал бота через /start."
             )
 
-        # 5. Уведомляем администратора.
         bot.answer_callback_query(
             call.id,
             "Объявление отмечено как проданное."
         )
 
-        bot.send_message(
+        show_screen(
             call.message.chat.id,
             "✅ <b>Объявление и товар отмечены как проданные.</b>\n\n"
             "Статус первоначального заказа не изменён.\n\n"
             f"📩 {esc(seller_notification)}\n\n"
-            f"🗑 {esc(deletion_result)}"
+            f"🗑 {esc(deletion_result)}",
+            reply_markup=back_home_keyboard("admin_resale")
         )
 
     except Exception:
-        logging.exception(
-            "Ошибка изменения статуса объявления"
-        )
-
+        logging.exception("Ошибка изменения статуса объявления")
         bot.answer_callback_query(
             call.id,
             "Ошибка изменения статуса. Проверьте логи.",
@@ -1720,11 +2030,21 @@ def admin_products(call):
             callback_data=f"admin_edit:{product['product_id']}"
         ))
 
+    markup.add(types.InlineKeyboardButton(
+        "⬅️ Назад",
+        callback_data="admin_back"
+    ))
+    markup.add(types.InlineKeyboardButton(
+        "🏠 Главное меню",
+        callback_data="go_home"
+    ))
+
     bot.answer_callback_query(call.id)
-    bot.send_message(
-        call.message.chat.id,
+
+    edit_screen(
+        call,
         "<b>📦 Выберите товар для редактирования:</b>",
-        reply_markup=markup
+        markup
     )
 
 
@@ -1764,13 +2084,22 @@ def admin_edit_product(call):
         "➕ Добавить секретный код",
         callback_data=f"addcode:{product_id}"
     ))
+    markup.add(types.InlineKeyboardButton(
+        "⬅️ К товарам",
+        callback_data="admin_products"
+    ))
+    markup.add(types.InlineKeyboardButton(
+        "🏠 Главное меню",
+        callback_data="go_home"
+    ))
 
     bot.answer_callback_query(call.id)
-    bot.send_message(
-        call.message.chat.id,
+
+    edit_screen(
+        call,
         f"<b>Редактирование товара:</b> {esc(product['name'])}\n"
         f"ID: <code>{esc(product_id)}</code>",
-        reply_markup=markup
+        markup
     )
 
 
@@ -1799,10 +2128,12 @@ def admin_edit_field(call):
     }
 
     bot.answer_callback_query(call.id)
-    bot.send_message(
+
+    show_screen(
         call.message.chat.id,
-        f"Введите новое значение для поля <b>{field}</b>.\n"
-        "Для отмены отправьте /cancel."
+        f"Введите новое значение для поля <b>{field}</b>.\n\n"
+        "Для отмены нажмите кнопку ниже или отправьте /cancel.",
+        reply_markup=back_home_keyboard("cancel_action")
     )
 
 
@@ -1820,12 +2151,20 @@ def admin_save_field(message):
     value = (message.text or "").strip()
 
     if not value:
-        bot.send_message(message.chat.id, "Значение не должно быть пустым.")
+        delete_user_message(message)
+        show_screen(
+            message.chat.id,
+            "Значение не должно быть пустым.",
+            reply_markup=back_home_keyboard("cancel_action")
+        )
         return
+
+    delete_user_message(message)
 
     try:
         if field == "price":
             value = float(Decimal(value.replace(",", ".")))
+
             if value <= 0:
                 raise ValueError("Цена должна быть больше нуля.")
 
@@ -1837,7 +2176,11 @@ def admin_save_field(message):
             elif normalized in ("нет", "no", "false", "0", "off"):
                 value = False
             else:
-                bot.send_message(message.chat.id, "Введите «да» или «нет».")
+                show_screen(
+                    message.chat.id,
+                    "Введите «да» или «нет».",
+                    reply_markup=back_home_keyboard("cancel_action")
+                )
                 return
 
         db.table("products").update({
@@ -1845,13 +2188,19 @@ def admin_save_field(message):
         }).eq("product_id", state["product_id"]).execute()
 
         clear_state(message.from_user.id)
-        bot.send_message(message.chat.id, "✅ Информация о товаре обновлена.")
+
+        show_screen(
+            message.chat.id,
+            "✅ Информация о товаре обновлена.",
+            reply_markup=back_home_keyboard("admin_products")
+        )
 
     except Exception:
         logging.exception("Ошибка редактирования товара")
-        bot.send_message(
+        show_screen(
             message.chat.id,
-            "Не удалось обновить поле. Проверьте значение."
+            "Не удалось обновить поле. Проверьте значение.",
+            reply_markup=back_home_keyboard("cancel_action")
         )
 
 
@@ -1873,10 +2222,12 @@ def admin_add_code_start(call):
     }
 
     bot.answer_callback_query(call.id)
-    bot.send_message(
+
+    show_screen(
         call.message.chat.id,
-        "Отправьте секретный код одним сообщением.\n"
-        "Для отмены отправьте /cancel."
+        "Отправьте секретный код одним сообщением.\n\n"
+        "Для отмены нажмите кнопку ниже или отправьте /cancel.",
+        reply_markup=back_home_keyboard("cancel_action")
     )
 
 
@@ -1893,8 +2244,15 @@ def admin_add_code(message):
     code = (message.text or "").strip()
 
     if not code:
-        bot.send_message(message.chat.id, "Код не должен быть пустым.")
+        delete_user_message(message)
+        show_screen(
+            message.chat.id,
+            "Код не должен быть пустым.",
+            reply_markup=back_home_keyboard("cancel_action")
+        )
         return
+
+    delete_user_message(message)
 
     try:
         db.table("product_codes").insert({
@@ -1904,13 +2262,19 @@ def admin_add_code(message):
         }).execute()
 
         clear_state(message.from_user.id)
-        bot.send_message(message.chat.id, "✅ Секретный код добавлен на склад.")
+
+        show_screen(
+            message.chat.id,
+            "✅ Секретный код добавлен на склад.",
+            reply_markup=back_home_keyboard("admin_products")
+        )
 
     except Exception:
         logging.exception("Ошибка добавления кода")
-        bot.send_message(
+        show_screen(
             message.chat.id,
-            "Не удалось добавить код. Возможно, такой код уже существует."
+            "Не удалось добавить код. Возможно, такой код уже существует.",
+            reply_markup=back_home_keyboard("cancel_action")
         )
 
 
@@ -1938,11 +2302,16 @@ def admin_payments(call):
     bot.answer_callback_query(call.id)
 
     if not payments:
-        bot.send_message(
-            call.message.chat.id,
-            "Нет платежей, ожидающих проверки."
+        edit_screen(
+            call,
+            "Нет платежей, ожидающих проверки.",
+            back_home_keyboard("admin_back")
         )
         return
+
+    # Список платежей отправляется отдельными важными сообщениями,
+    # чтобы кнопки одобрения/отклонения оставались доступными.
+    clear_screen(call.message.chat.id)
 
     for payment in payments:
         text = (
@@ -1971,6 +2340,12 @@ def admin_payments(call):
             reply_markup=markup
         )
 
+    bot.send_message(
+        call.message.chat.id,
+        "⬅️ Вернуться в админ-панель:",
+        reply_markup=back_home_keyboard("admin_back")
+    )
+
 
 # =========================================================
 # МЕНЮ И НЕИЗВЕСТНЫЕ СООБЩЕНИЯ
@@ -1988,6 +2363,7 @@ def menu_command(message):
         return
 
     clear_state(user_id)
+    clear_screen(message.chat.id)
 
     bot.send_message(
         message.chat.id,
@@ -2005,17 +2381,17 @@ def unknown_message(message):
         bot.send_message(
             message.chat.id,
             "👋 Добро пожаловать!\n\n"
-            "Чтобы открыть наш магазин, отправьте команду /start."
+            "Чтобы открыть магазин, отправьте команду /start."
         )
         return
 
     if states.get(message.from_user.id):
         return
 
-    bot.send_message(
+    show_screen(
         message.chat.id,
         "👋 Чтобы открыть раздел магазина, используйте кнопки меню.",
-        reply_markup=main_menu(message.from_user.id)
+        reply_markup=back_home_keyboard()
     )
 
 
