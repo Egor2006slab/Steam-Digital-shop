@@ -1,2111 +1,1377 @@
 import os
-import uuid
+import re
 import html
+import logging
 from decimal import Decimal, InvalidOperation
+from datetime import datetime, timezone
 
 import telebot
 from telebot import types
 from supabase import create_client
 
 
-# ==================================================
+# =========================================================
 # НАСТРОЙКИ
-# ==================================================
+# =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID_RAW = os.getenv("ADMIN_ID")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-if not all([BOT_TOKEN, ADMIN_ID_RAW, SUPABASE_URL, SUPABASE_KEY]):
-    raise RuntimeError("Не заданы необходимые переменные окружения")
+WALLET = "TNYOixEzXVbuAxOpVmoXGvAFFMxn4NKgKl"
+NETWORK = "TRC20"
+ASSET = "USDT"
 
-ADMIN_ID = int(ADMIN_ID_RAW)
+if not all([BOT_TOKEN, ADMIN_ID, SUPABASE_URL, SUPABASE_KEY]):
+    raise RuntimeError("Не заданы BOT_TOKEN, ADMIN_ID, SUPABASE_URL или SUPABASE_KEY")
 
-bot = telebot.TeleBot(BOT_TOKEN)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 db = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-CATEGORIES = {
-    "gifts": "🎁 Подарочные карты",
-    "games": "🎮 Игры",
-    "subs": "⭐ Подписки"
-}
+# Временные состояния диалогов.
+# При перезапуске бота они сбрасываются, но заказы и оплаты хранятся в Supabase.
+states = {}
 
-COMMISSION = Decimal("5.00")
-
-admin_states = {}
-support_waiting = set()
-topup_waiting = set()
-resale_states = {}
+# Для ответов поддержки администратором в рамках одного запуска.
+support_replies = {}
 
 
-# ==================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ==================================================
+# =========================================================
+# ОБЩИЕ ФУНКЦИИ
+# =========================================================
 
-def is_admin(user_id):
-    return user_id == ADMIN_ID
+def esc(value):
+    return html.escape(str(value or ""))
 
 
 def money(value):
     try:
-        return Decimal(str(value)).quantize(Decimal("0.01"))
+        return f"{Decimal(str(value)):,.2f}".replace(",", " ")
     except Exception:
-        return Decimal("0.00")
+        return "0.00"
 
 
-def money_text(value):
-    return f"{money(value):.2f}"
+def rpc(name, params):
+    result = db.rpc(name, params).execute()
+    return result.data
 
 
-def safe_text(value):
-    return html.escape(str(value or ""))
-
-
-def get_user_record(user_id):
-    try:
-        result = (
-            db.table("users")
-            .select("*")
-            .eq("user_id", user_id)
-            .execute()
-            .data
-        )
-        return result[0] if result else None
-    except Exception as error:
-        print("Ошибка пользователя:", error)
-        return None
-
-
-def get_balance(user_id):
-    user = get_user_record(user_id)
-    return money(user.get("balance", 0)) if user else Decimal("0.00")
+def first_row(data):
+    if isinstance(data, list):
+        return data[0] if data else None
+    if isinstance(data, dict):
+        return data
+    return None
 
 
 def save_user(user):
-    try:
-        data = {
-            "user_id": user.id,
-            "username": user.username or "",
-            "first_name": user.first_name or "",
-            "last_name": user.last_name or ""
-        }
-
-        existing = (
-            db.table("users")
-            .select("user_id")
-            .eq("user_id", user.id)
-            .execute()
-            .data
-        )
-
-        if existing:
-            db.table("users").update(data).eq(
-                "user_id", user.id
-            ).execute()
-        else:
-            db.table("users").insert(data).execute()
-
-    except Exception as error:
-        print("Ошибка сохранения пользователя:", error)
+    db.table("users").upsert({
+        "user_id": user.id,
+        "username": user.username,
+        "first_name": user.first_name
+    }, on_conflict="user_id").execute()
 
 
-def notify_user(user_id, text):
-    try:
-        bot.send_message(user_id, text, parse_mode="HTML")
-    except Exception as error:
-        print("Ошибка отправки сообщения:", error)
+def is_admin(user_id):
+    return int(user_id) == ADMIN_ID
 
 
-# ==================================================
-# ТОВАРЫ
-# ==================================================
+def clear_state(user_id):
+    states.pop(user_id, None)
 
-def get_products(active_only=False):
-    try:
-        query = db.table("products").select("*")
 
-        if active_only:
-            query = query.eq("active", True)
+def main_menu(user_id):
+    markup = types.ReplyKeyboardMarkup(
+        resize_keyboard=True,
+        row_width=2
+    )
 
-        return query.order("name").execute().data or []
+    markup.row("🛍 Каталог", "📦 Мои заказы")
+    markup.row("💳 История платежей", "👤 Профиль")
+    markup.row("🆘 Поддержка")
 
-    except Exception as error:
-        print("Ошибка товаров:", error)
-        return []
+    if is_admin(user_id):
+        markup.row("⚙️ Админ-панель")
+
+    return markup
+
+
+def send_home(chat_id, text="Главное меню"):
+    clear_state(chat_id)
+    bot.send_message(chat_id, text, reply_markup=main_menu(chat_id))
 
 
 def get_product(product_id):
-    try:
-        result = (
-            db.table("products")
-            .select("*")
-            .eq("product_id", str(product_id))
-            .execute()
-            .data
-        )
-        return result[0] if result else None
-    except Exception as error:
-        print("Ошибка товара:", error)
-        return None
+    result = (
+        db.table("products")
+        .select("*")
+        .eq("product_id", str(product_id))
+        .limit(1)
+        .execute()
+    )
+    return first_row(result.data)
 
 
-def add_product(product_id, category, name, price, description):
-    try:
-        db.table("products").insert({
-            "product_id": str(product_id),
-            "category": category,
-            "name": name,
-            "price": float(price),
-            "description": description,
-            "active": True,
-            "resale_allowed": False
-        }).execute()
-        return True
-    except Exception as error:
-        print("Ошибка добавления товара:", error)
-        return False
+def get_payment(payment_ref):
+    result = (
+        db.table("crypto_payments")
+        .select("*")
+        .eq("payment_ref", payment_ref)
+        .limit(1)
+        .execute()
+    )
+    return first_row(result.data)
 
 
-def change_price(product_id, price):
-    try:
-        db.table("products").update({
-            "price": float(price)
-        }).eq("product_id", str(product_id)).execute()
-        return True
-    except Exception as error:
-        print("Ошибка цены:", error)
-        return False
+def payment_keyboard(payment_ref):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(
+        "✅ Я оплатил",
+        callback_data=f"report:{payment_ref}"
+    ))
+    return markup
 
 
-def toggle_product(product_id, active):
-    try:
-        db.table("products").update({
-            "active": active
-        }).eq("product_id", str(product_id)).execute()
-        return True
-    except Exception as error:
-        print("Ошибка статуса товара:", error)
-        return False
-
-
-def delete_product(product_id):
-    try:
-        db.table("products").update({
-            "active": False
-        }).eq("product_id", str(product_id)).execute()
-        return True
-    except Exception as error:
-        print("Ошибка скрытия товара:", error)
-        return False
-
-
-# ==================================================
-# СКЛАД И ЦИФРОВЫЕ КОДЫ
-# ==================================================
-
-def get_stock_count(product_id):
-    try:
-        result = (
-            db.table("product_codes")
-            .select("id", count="exact")
-            .eq("product_id", str(product_id))
-            .eq("status", "available")
-            .execute()
-        )
-        return result.count or 0
-    except Exception as error:
-        print("Ошибка остатков:", error)
-        return 0
-
-
-def add_product_codes(product_id, codes):
-    added = 0
-    duplicates = 0
-    errors = 0
-
-    for code in codes:
-        code = code.strip()
-
-        if not code:
-            continue
-
-        try:
-            db.table("product_codes").insert({
-                "product_id": str(product_id),
-                "secret_code": code,
-                "status": "available"
-            }).execute()
-
-            added += 1
-
-        except Exception as error:
-            error_text = str(error).lower()
-
-            if "duplicate" in error_text or "unique" in error_text:
-                duplicates += 1
-            else:
-                errors += 1
-                print("Ошибка добавления кода:", error)
-
-    return added, duplicates, errors
-
-
-def get_order_code(order_id, user_id):
-    try:
-        order = (
-            db.table("orders")
-            .select("order_id")
-            .eq("order_id", order_id)
-            .eq("user_id", user_id)
-            .execute()
-            .data
-        )
-
-        if not order:
-            return None
-
-        result = (
-            db.table("product_codes")
-            .select("secret_code")
-            .eq("order_id", order_id)
-            .eq("status", "sold")
-            .limit(1)
-            .execute()
-            .data
-        )
-
-        return result[0]["secret_code"] if result else None
-
-    except Exception as error:
-        print("Ошибка получения кода:", error)
-        return None
-
-
-# ==================================================
-# ЗАКАЗЫ
-# ==================================================
-
-def get_order(order_id):
-    try:
-        result = (
-            db.table("orders")
-            .select("*")
-            .eq("order_id", order_id)
-            .execute()
-            .data
-        )
-        return result[0] if result else None
-    except Exception as error:
-        print("Ошибка заказа:", error)
-        return None
-
-
-def update_order(order_id, status):
-    try:
-        db.table("orders").update({
-            "status": status
-        }).eq("order_id", order_id).execute()
-        return True
-    except Exception as error:
-        print("Ошибка изменения заказа:", error)
-        return False
-
-
-# ==================================================
-# БАЛАНС
-# ==================================================
-
-def get_balance_history(user_id):
-    try:
-        return (
-            db.table("balance_transactions")
-            .select("*")
-            .eq("user_id", user_id)
-            .order("created_at", desc=True)
-            .limit(10)
-            .execute()
-            .data or []
-        )
-    except Exception as error:
-        print("Ошибка истории:", error)
-        return None
-
-
-# ==================================================
-# ГЛАВНОЕ МЕНЮ
-# ==================================================
-
-def main_menu(user_id):
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-
-    keyboard.row("🛍 Каталог", "📦 Мои заказы")
-    keyboard.row("👤 Мой профиль", "💳 Пополнить баланс")
-    keyboard.row("🏪 Вторичный рынок", "🔄 Продать товар")
-    keyboard.row("📋 Мои объявления")
-    keyboard.row("💬 Поддержка")
-
-    if is_admin(user_id):
-        keyboard.row("⚙️ Админ-панель")
-
-    return keyboard
-
-
-# ==================================================
-# START
-# ==================================================
+# =========================================================
+# СТАРТ И ПРОФИЛЬ
+# =========================================================
 
 @bot.message_handler(commands=["start"])
 def start(message):
     save_user(message.from_user)
-
-    bot.send_message(
+    send_home(
         message.chat.id,
-        "👋 Добро пожаловать в <b>Digital Shop</b>!\n\n"
-        "Выбирай товары в каталоге или загляни на вторичный рынок.",
-        parse_mode="HTML",
-        reply_markup=main_menu(message.from_user.id)
+        "Добро пожаловать в магазин цифровых товаров!"
     )
 
 
-# ==================================================
-# ПРОФИЛЬ
-# ==================================================
+@bot.message_handler(commands=["cancel"])
+def cancel(message):
+    clear_state(message.from_user.id)
+    send_home(message.chat.id, "Действие отменено.")
 
-@bot.message_handler(func=lambda m: m.text == "👤 Мой профиль")
-def show_profile(message):
-    user_id = message.from_user.id
+
+@bot.message_handler(func=lambda m: m.text == "👤 Профиль")
+def profile(message):
     save_user(message.from_user)
 
-    user = get_user_record(user_id)
-
-    if not user:
-        bot.send_message(message.chat.id, "Не удалось загрузить профиль.")
-        return
-
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton(
-        "📜 История баланса",
-        callback_data="balance_history"
-    ))
-
-    bot.send_message(
-        message.chat.id,
-        "👤 <b>Мой профиль</b>\n\n"
-        f"🆔 ID: <code>{user_id}</code>\n"
-        f"💰 Баланс: <b>{money_text(user.get('balance', 0))} USDT</b>\n"
-        f"🛍 Покупок: <b>{user.get('purchased_count', 0)}</b>",
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "balance_history")
-def show_balance_history(call):
-    bot.answer_callback_query(call.id)
-
-    history = get_balance_history(call.from_user.id)
-
-    if history is None:
-        bot.send_message(call.message.chat.id, "Ошибка загрузки истории.")
-        return
-
-    if not history:
-        bot.send_message(call.message.chat.id, "История пока пуста.")
-        return
-
-    names = {
-        "admin_credit": "➕ Начисление",
-        "admin_debit": "➖ Списание",
-        "purchase": "🛒 Покупка",
-        "refund": "↩️ Возврат",
-        "resale_purchase": "🛍 Покупка на вторичном рынке",
-        "resale_sale": "💰 Продажа на вторичном рынке"
-    }
-
-    text = "📜 <b>История баланса</b>\n\n"
-
-    for item in history:
-        operation = item.get("operation", "")
-        amount = money(item.get("amount", 0))
-
-        text += (
-            f"{names.get(operation, operation)}\n"
-            f"Сумма: <b>{amount:+.2f} USDT</b>\n"
-            f"{safe_text(item.get('description'))}\n\n"
-        )
-
-    bot.send_message(call.message.chat.id, text, parse_mode="HTML")
-
-
-# ==================================================
-# ПОПОЛНЕНИЕ БАЛАНСА
-# ==================================================
-
-@bot.message_handler(func=lambda m: m.text == "💳 Пополнить баланс")
-def start_topup(message):
-    topup_waiting.add(message.from_user.id)
-
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add("Отмена")
-
-    bot.send_message(
-        message.chat.id,
-        "💳 <b>Пополнение баланса</b>\n\n"
-        "Напиши сумму в USDT. Например: <code>25</code>",
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
-
-
-@bot.message_handler(
-    func=lambda m: m.from_user.id in topup_waiting
-    and bool(m.text)
-    and m.text != "Отмена"
-)
-def process_topup_request(message):
     user = message.from_user
+    username = f"@{esc(user.username)}" if user.username else "Не указан"
 
-    try:
-        amount = Decimal(message.text.replace(",", ".").strip())
-
-        if amount <= 0 or amount > Decimal("100000"):
-            raise ValueError
-
-        amount = amount.quantize(Decimal("0.01"))
-
-    except (InvalidOperation, ValueError):
-        bot.send_message(message.chat.id, "Введи корректную сумму.")
-        return
-
-    topup_waiting.discard(user.id)
-    save_user(user)
-
-    bot.send_message(
-        ADMIN_ID,
-        "💳 <b>Запрос на пополнение</b>\n\n"
-        f"Пользователь: {safe_text(user.first_name)}\n"
+    text = (
+        "<b>👤 Ваш профиль</b>\n\n"
         f"ID: <code>{user.id}</code>\n"
-        f"Сумма: <b>{amount:.2f} USDT</b>\n\n"
-        "После проверки оплаты начисли баланс через админ-панель.",
-        parse_mode="HTML"
+        f"Имя: {esc(user.first_name)}\n"
+        f"Username: {username}\n\n"
+        "Все цены магазина указаны в USDT."
     )
 
-    bot.send_message(
-        message.chat.id,
-        "✅ Запрос отправлен администратору.",
-        reply_markup=main_menu(user.id)
+    bot.send_message(message.chat.id, text)
+
+
+# =========================================================
+# КАТАЛОГ И КАРТОЧКИ ТОВАРОВ
+# =========================================================
+
+@bot.message_handler(func=lambda m: m.text == "🛍 Каталог")
+def catalog(message):
+    save_user(message.from_user)
+
+    result = (
+        db.table("products")
+        .select("product_id,name,category,price")
+        .eq("active", True)
+        .order("name")
+        .execute()
     )
 
+    products = result.data or []
 
-# ==================================================
-# КАТАЛОГ
-# ==================================================
+    markup = types.InlineKeyboardMarkup(row_width=1)
 
-def catalog_keyboard():
-    keyboard = types.InlineKeyboardMarkup()
-
-    for category_id, category_name in CATEGORIES.items():
-        keyboard.add(types.InlineKeyboardButton(
-            category_name,
-            callback_data=f"cat_{category_id}"
-        ))
-
-    return keyboard
-
-
-def products_keyboard(category):
-    keyboard = types.InlineKeyboardMarkup()
-
-    for product in get_products(active_only=True):
-        if product.get("category") != category:
-            continue
-
-        stock = get_stock_count(product["product_id"])
-
-        keyboard.add(types.InlineKeyboardButton(
-            f"{product['name']} — {money_text(product['price'])} USDT | Остаток: {stock}",
+    for product in products:
+        title = (
+            f"{product['name']} — "
+            f"{money(product['price'])} USDT"
+        )
+        markup.add(types.InlineKeyboardButton(
+            title,
             callback_data=f"product:{product['product_id']}"
         ))
 
-    keyboard.add(types.InlineKeyboardButton(
-        "⬅️ Назад",
-        callback_data="catalog"
+    markup.add(types.InlineKeyboardButton(
+        "🔄 Перепродажа",
+        callback_data="resale_catalog"
     ))
 
-    return keyboard
-
-
-@bot.message_handler(func=lambda m: m.text == "🛍 Каталог")
-def open_catalog(message):
     bot.send_message(
         message.chat.id,
-        "🛍 <b>Каталог товаров</b>\n\nВыбери категорию:",
-        parse_mode="HTML",
-        reply_markup=catalog_keyboard()
-    )
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "catalog")
-def back_catalog(call):
-    bot.answer_callback_query(call.id)
-
-    bot.edit_message_text(
-        "🛍 <b>Каталог товаров</b>\n\nВыбери категорию:",
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="HTML",
-        reply_markup=catalog_keyboard()
-    )
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("cat_"))
-def open_category(call):
-    bot.answer_callback_query(call.id)
-
-    category = call.data.replace("cat_", "", 1)
-
-    if category not in CATEGORIES:
-        return
-
-    bot.edit_message_text(
-        f"<b>{CATEGORIES[category]}</b>\n\nВыбери товар:",
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="HTML",
-        reply_markup=products_keyboard(category)
+        "<b>🛍 Каталог товаров</b>\n\nВыберите товар:",
+        reply_markup=markup
     )
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("product:"))
-def open_product(call):
-    bot.answer_callback_query(call.id)
-
+def product_card(call):
     product_id = call.data.split(":", 1)[1]
     product = get_product(product_id)
 
     if not product or not product.get("active"):
-        bot.send_message(call.message.chat.id, "Товар недоступен.")
+        bot.answer_callback_query(call.id, "Товар недоступен.")
         return
 
-    stock = get_stock_count(product_id)
-
     text = (
-        f"🛍 <b>{safe_text(product['name'])}</b>\n\n"
-        f"{safe_text(product.get('description'))}\n\n"
-        f"💰 Цена: <b>{money_text(product['price'])} USDT</b>\n"
-        f"📦 Осталось: <b>{stock}</b>"
+        f"<b>{esc(product.get('name'))}</b>\n\n"
+        f"ID: <code>{esc(product.get('product_id'))}</code>\n"
+        f"Категория: {esc(product.get('category'))}\n"
+        f"Стоимость: <b>{money(product.get('price'))} USDT</b>\n\n"
+        f"<b>Информация:</b>\n"
+        f"{esc(product.get('description'))}\n\n"
+        f"Происхождение: {esc(product.get('origin_status'))}\n"
+        f"Владелец: {esc(product.get('owner_status'))}\n"
+        f"Передача: {esc(product.get('transfer_status'))}\n"
     )
 
-    keyboard = types.InlineKeyboardMarkup()
+    verification = product.get("verification_info") or ""
 
-    if stock > 0:
-        keyboard.add(types.InlineKeyboardButton(
-            "🛒 Купить",
-            callback_data=f"buy:{product_id}"
+    markup = types.InlineKeyboardMarkup()
+    if verification.strip():
+        markup.add(types.InlineKeyboardButton(
+            "🔎 Проверить сведения",
+            callback_data=f"verify:{product_id}"
         ))
-    else:
-        text += "\n\n❌ <b>Нет в наличии</b>"
 
-    keyboard.add(types.InlineKeyboardButton(
-        "⬅️ Назад",
-        callback_data=f"cat_{product['category']}"
+    markup.add(types.InlineKeyboardButton(
+        "🛒 Купить",
+        callback_data=f"buy:{product_id}"
     ))
 
-    bot.edit_message_text(
-        text,
+    markup.add(types.InlineKeyboardButton(
+        "⬅️ В каталог",
+        callback_data="back_catalog"
+    ))
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, text, reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("verify:"))
+def verify_product(call):
+    product_id = call.data.split(":", 1)[1]
+    product = get_product(product_id)
+
+    if not product:
+        bot.answer_callback_query(call.id, "Товар не найден.")
+        return
+
+    info = product.get("verification_info") or "Дополнительные сведения не указаны."
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
         call.message.chat.id,
-        call.message.message_id,
-        parse_mode="HTML",
-        reply_markup=keyboard
+        "<b>🔎 Дополнительные сведения</b>\n\n" + esc(info)
     )
 
 
-# ==================================================
-# ПОКУПКА И АВТОМАТИЧЕСКАЯ ВЫДАЧА
-# ==================================================
+@bot.callback_query_handler(func=lambda c: c.data == "back_catalog")
+def back_catalog(call):
+    bot.answer_callback_query(call.id)
+
+    result = (
+        db.table("products")
+        .select("product_id,name,price")
+        .eq("active", True)
+        .order("name")
+        .execute()
+    )
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    for p in result.data or []:
+        markup.add(types.InlineKeyboardButton(
+            f"{p['name']} — {money(p['price'])} USDT",
+            callback_data=f"product:{p['product_id']}"
+        ))
+
+    markup.add(types.InlineKeyboardButton(
+        "🔄 Перепродажа",
+        callback_data="resale_catalog"
+    ))
+
+    bot.send_message(
+        call.message.chat.id,
+        "<b>🛍 Каталог</b>",
+        reply_markup=markup
+    )
+
+
+# =========================================================
+# ПОКУПКА И ОПЛАТА
+# =========================================================
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("buy:"))
 def buy_product(call):
+    user_id = call.from_user.id
     product_id = call.data.split(":", 1)[1]
-    product = get_product(product_id)
 
-    if not product or not product.get("active"):
-        bot.answer_callback_query(call.id, "Товар недоступен.", show_alert=True)
-        return
-
-    user = call.from_user
-    save_user(user)
-
-    price = money(product["price"])
-
-    if price <= 0:
-        bot.answer_callback_query(call.id, "Некорректная цена.", show_alert=True)
-        return
-
-    order_id = uuid.uuid4().hex[:10].upper()
+    save_user(call.from_user)
 
     try:
-        result = db.rpc(
-            "create_paid_order_with_code",
-            {
-                "p_order_id": order_id,
-                "p_user_id": user.id,
-                "p_product": product["name"],
-                "p_price": str(price)
-            }
-        ).execute()
+        data = rpc("create_purchase_payment", {
+            "p_user_id": user_id,
+            "p_product_id": product_id
+        })
 
-        data = result.data
+        row = first_row(data)
 
-        if isinstance(data, list):
-            data = data[0] if data else {}
+        if not row:
+            bot.answer_callback_query(
+                call.id,
+                "Не удалось создать заказ. Проверьте наличие товара.",
+                show_alert=True
+            )
+            return
 
-        if not isinstance(data, dict):
-            raise ValueError("Неожиданный ответ Supabase")
-
-        new_balance = money(data.get("new_balance"))
-        secret_code = data.get("secret_code")
-
-        if not secret_code:
-            raise ValueError("Код не получен")
-
-    except Exception as error:
-        print("Ошибка покупки:", error)
-
-        bot.answer_callback_query(
-            call.id,
-            "Покупка не состоялась. Проверь баланс и наличие товара.",
-            show_alert=True
-        )
-        return
-
-    bot.answer_callback_query(call.id, "Покупка успешна!")
-
-    try:
-        bot.send_message(
-            user.id,
-            "✅ <b>Покупка успешна!</b>\n\n"
-            f"Номер заказа: <code>{order_id}</code>\n"
-            f"Товар: {safe_text(product['name'])}\n"
-            f"Списано: <b>{price:.2f} USDT</b>\n"
-            f"Остаток: <b>{new_balance:.2f} USDT</b>\n\n"
-            "🔐 <b>Твой цифровой код:</b>\n"
-            f"<code>{safe_text(secret_code)}</code>\n\n"
-            "Сохрани код и не передавай его посторонним.",
-            parse_mode="HTML",
-            reply_markup=main_menu(user.id)
-        )
-
-    except Exception as error:
-        print("Ошибка доставки кода:", error)
-
-        notify_user(
-            user.id,
-            "⚠️ Покупка прошла, но код не удалось отправить.\n"
-            f"Номер заказа: <code>{order_id}</code>\n"
-            "Открой «Мои заказы» и нажми «Получить код»."
-        )
-
-    bot.send_message(
-        ADMIN_ID,
-        "🆕 <b>Новая покупка — код выдан автоматически!</b>\n\n"
-        f"Номер: <code>{order_id}</code>\n"
-        f"Покупатель ID: <code>{user.id}</code>\n"
-        f"Товар: {safe_text(product['name'])}\n"
-        f"Цена: {price:.2f} USDT\n"
-        f"Баланс покупателя: {new_balance:.2f} USDT",
-        parse_mode="HTML"
-    )
-
-
-# ==================================================
-# МОИ ЗАКАЗЫ И ПОВТОРНАЯ ВЫДАЧА КОДА
-# ==================================================
-
-@bot.message_handler(func=lambda m: m.text == "📦 Мои заказы")
-def my_orders(message):
-    try:
-        orders = (
-            db.table("orders")
-            .select("*")
-            .eq("user_id", message.from_user.id)
-            .order("created_at", desc=True)
-            .limit(15)
-            .execute()
-            .data or []
-        )
-
-    except Exception as error:
-        print("Ошибка заказов:", error)
-        bot.send_message(message.chat.id, "Не удалось загрузить заказы.")
-        return
-
-    if not orders:
-        bot.send_message(message.chat.id, "Заказов пока нет.")
-        return
-
-    for order in orders:
-        order_id = order.get("order_id")
+        payment_ref = row["payment_ref"]
+        order_id = row["order_id"]
+        product_name = row.get("product_name", "Цифровой товар")
+        price = row["price"]
+        wallet = row.get("wallet_address") or WALLET
 
         text = (
-            "📦 <b>Заказ</b>\n\n"
-            f"Номер: <code>{safe_text(order_id)}</code>\n"
-            f"Товар: {safe_text(order.get('product'))}\n"
-            f"Цена: {money_text(order.get('price'))} USDT\n"
-            f"Статус: {safe_text(order.get('status'))}"
+            "<b>🧾 Заказ создан</b>\n\n"
+            f"Товар: {esc(product_name)}\n"
+            f"Номер заказа: <code>{esc(order_id)}</code>\n"
+            f"Сумма: <b>{money(price)} USDT</b>\n\n"
+            f"<b>Сеть:</b> {NETWORK}\n"
+            f"<b>Монета:</b> {ASSET}\n"
+            f"<b>Кошелёк для оплаты:</b>\n"
+            f"<code>{esc(wallet)}</code>\n\n"
+            "Переведите точную сумму в USDT по сети TRC20.\n"
+            "После перевода нажмите «Я оплатил».\n\n"
+            "Код товара будет выдан только после проверки оплаты администратором."
         )
 
-        keyboard = types.InlineKeyboardMarkup()
-
-        if order.get("status") == "Выдан покупателю":
-            keyboard.add(types.InlineKeyboardButton(
-                "🔐 Получить код",
-                callback_data=f"get_code:{order_id}"
-            ))
-
+        bot.answer_callback_query(call.id, "Заказ создан.")
         bot.send_message(
-            message.chat.id,
+            call.message.chat.id,
             text,
-            parse_mode="HTML",
-            reply_markup=keyboard
+            reply_markup=payment_keyboard(payment_ref)
         )
 
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("get_code:"))
-def resend_order_code(call):
-    order_id = call.data.split(":", 1)[1]
-
-    code = get_order_code(order_id, call.from_user.id)
-
-    if not code:
+    except Exception:
+        logging.exception("Ошибка создания покупки")
         bot.answer_callback_query(
             call.id,
-            "Код не найден для этого заказа.",
+            "Ошибка создания заказа. Попробуйте позже.",
+            show_alert=True
+        )
+
+
+# =========================================================
+# СООБЩЕНИЕ ОБ ОПЛАТЕ
+# =========================================================
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("report:"))
+def report_payment_start(call):
+    payment_ref = call.data.split(":", 1)[1]
+    payment = get_payment(payment_ref)
+
+    if not payment or int(payment["user_id"]) != call.from_user.id:
+        bot.answer_callback_query(call.id, "Платёж не найден.", show_alert=True)
+        return
+
+    if payment["status"] != "awaiting_payment":
+        bot.answer_callback_query(
+            call.id,
+            f"Статус платежа: {payment['status']}",
             show_alert=True
         )
         return
 
-    bot.answer_callback_query(call.id, "Код отправлен.")
-
-    bot.send_message(
-        call.from_user.id,
-        "🔐 <b>Цифровой код твоего заказа</b>\n\n"
-        f"Заказ: <code>{safe_text(order_id)}</code>\n"
-        f"Код: <code>{safe_text(code)}</code>\n\n"
-        "Не передавай его посторонним.",
-        parse_mode="HTML"
-    )
-
-
-# ==================================================
-# ВТОРИЧНЫЙ РЫНОК
-# ==================================================
-
-def get_listing(listing_id):
+    # Перед отправкой отчёта помечаем просроченные неоплаченные платежи.
     try:
-        result = (
-            db.table("resale_listings")
-            .select("*")
-            .eq("id", listing_id)
-            .eq("status", "active")
-            .execute()
-            .data
+        rpc("expire_unpaid_crypto_payments", {})
+    except Exception:
+        logging.exception("Не удалось проверить истёкшие платежи")
+
+    payment = get_payment(payment_ref)
+
+    if not payment or payment["status"] != "awaiting_payment":
+        bot.answer_callback_query(
+            call.id,
+            "Время оплаты истекло или платёж уже обработан.",
+            show_alert=True
         )
-        return result[0] if result else None
-    except Exception as error:
-        print("Ошибка объявления:", error)
-        return None
-
-
-def get_good(good_id):
-    try:
-        result = (
-            db.table("resale_goods")
-            .select("*")
-            .eq("id", good_id)
-            .execute()
-            .data
-        )
-        return result[0] if result else None
-    except Exception as error:
-        print("Ошибка товара перепродажи:", error)
-        return None
-
-
-def get_resale_product(good):
-    return get_product(good.get("product_id")) if good else None
-
-
-@bot.message_handler(func=lambda m: m.text == "🏪 Вторичный рынок")
-def resale_market(message):
-    try:
-        listings = (
-            db.table("resale_listings")
-            .select("*")
-            .eq("status", "active")
-            .order("created_at", desc=True)
-            .limit(30)
-            .execute()
-            .data or []
-        )
-    except Exception as error:
-        print("Ошибка рынка:", error)
-        bot.send_message(message.chat.id, "Не удалось загрузить рынок.")
         return
 
-    if not listings:
-        bot.send_message(message.chat.id, "🏪 Пока нет объявлений.")
-        return
+    states[call.from_user.id] = {
+        "action": "report_payment",
+        "payment_ref": payment_ref
+    }
 
-    bot.send_message(
-        message.chat.id,
-        "🏪 <b>Вторичный рынок</b>",
-        parse_mode="HTML"
-    )
-
-    for listing in listings:
-        good = get_good(listing["good_id"])
-        product = get_resale_product(good)
-
-        if not good or not product:
-            continue
-
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton(
-            "👀 Посмотреть",
-            callback_data=f"resale_view:{listing['id']}"
-        ))
-
-        bot.send_message(
-            message.chat.id,
-            f"🛍 <b>{safe_text(product['name'])}</b>\n"
-            f"💰 Цена: <b>{money_text(listing['asking_price'])} USDT</b>",
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("resale_view:"))
-def resale_view(call):
-    listing_id = int(call.data.split(":", 1)[1])
-    listing = get_listing(listing_id)
-
-    if not listing:
-        bot.answer_callback_query(call.id, "Объявление недоступно.", show_alert=True)
-        return
-
-    if listing["seller_id"] == call.from_user.id:
-        bot.answer_callback_query(call.id, "Нельзя купить своё объявление.", show_alert=True)
-        return
-
-    good = get_good(listing["good_id"])
-    product = get_resale_product(good)
-
-    if not good or not product:
-        bot.answer_callback_query(call.id, "Товар не найден.", show_alert=True)
-        return
-
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton(
-        "🛒 Купить",
-        callback_data=f"resale_buy:{listing_id}"
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(
+        "Пропустить хеш транзакции",
+        callback_data=f"nohash:{payment_ref}"
     ))
 
     bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        "Отправьте хеш транзакции (TXID) сообщением.\n"
+        "Если не хотите его указывать, нажмите кнопку ниже.",
+        reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("nohash:"))
+def report_without_hash(call):
+    payment_ref = call.data.split(":", 1)[1]
+    submit_payment_report(call.from_user.id, payment_ref, None)
+    bot.answer_callback_query(call.id)
+
+
+def submit_payment_report(user_id, payment_ref, tx_hash):
+    try:
+        rpc("expire_unpaid_crypto_payments", {})
+    except Exception:
+        logging.exception("Ошибка проверки срока платежа")
+
+    payment = get_payment(payment_ref)
+
+    if not payment or int(payment["user_id"]) != user_id:
+        bot.send_message(user_id, "Платёж не найден.")
+        clear_state(user_id)
+        return
+
+    if payment["status"] != "awaiting_payment":
+        bot.send_message(
+            user_id,
+            "Этот платёж уже обработан или срок его оплаты истёк."
+        )
+        clear_state(user_id)
+        return
+
+    rpc("report_crypto_payment", {
+        "p_payment_ref": payment_ref,
+        "p_user_id": user_id,
+        "p_tx_hash": tx_hash
+    })
+
+    clear_state(user_id)
+
+    bot.send_message(
+        user_id,
+        "✅ Информация об оплате отправлена администратору.\n"
+        "После проверки вы получите уведомление о результате."
+    )
+
+    try:
+        admin_text = (
+            "<b>💳 Новое сообщение об оплате</b>\n\n"
+            f"Платёж: <code>{esc(payment_ref)}</code>\n"
+            f"Пользователь: <code>{user_id}</code>\n"
+            f"Сумма: {money(payment['amount'])} USDT\n"
+            f"Тип: {esc(payment['payment_type'])}\n"
+            f"TXID: <code>{esc(tx_hash or 'Не указан')}</code>"
+        )
+
+        markup = types.InlineKeyboardMarkup()
+        markup.row(
+            types.InlineKeyboardButton(
+                "✅ Одобрить",
+                callback_data=f"review_yes:{payment_ref}"
+            ),
+            types.InlineKeyboardButton(
+                "❌ Отклонить",
+                callback_data=f"review_no:{payment_ref}"
+            )
+        )
+
+        bot.send_message(ADMIN_ID, admin_text, reply_markup=markup)
+
+    except Exception:
+        logging.exception("Не удалось отправить уведомление администратору")
+
+
+# =========================================================
+# ПОЛУЧЕНИЕ TXID ОТ ПОЛЬЗОВАТЕЛЯ
+# =========================================================
+
+@bot.message_handler(
+    func=lambda m: states.get(m.from_user.id, {}).get("action") == "report_payment"
+)
+def receive_tx_hash(message):
+    tx_hash = (message.text or "").strip()
+
+    if not tx_hash:
+        bot.send_message(message.chat.id, "Отправьте текстовый TXID или нажмите «Пропустить».")
+        return
+
+    if len(tx_hash) > 200:
+        bot.send_message(message.chat.id, "Слишком длинный TXID.")
+        return
+
+    payment_ref = states[message.from_user.id]["payment_ref"]
+    submit_payment_report(message.from_user.id, payment_ref, tx_hash)
+
+
+# =========================================================
+# АДМИН: ПРОВЕРКА И ОДОБРЕНИЕ ОПЛАТ
+# =========================================================
+
+def notify_payment_result(payment, approved, secret_code=None):
+    user_id = int(payment["user_id"])
+
+    if approved:
+        text = (
+            "✅ <b>Оплата подтверждена!</b>\n\n"
+            "Ваш заказ одобрен администратором."
+        )
+
+        if secret_code:
+            text += f"\n\nВаш секретный код:\n<code>{esc(secret_code)}</code>"
+
+        bot.send_message(user_id, text)
+
+    else:
+        bot.send_message(
+            user_id,
+            "❌ Оплата отклонена администратором.\n"
+            "Если вы считаете, что произошла ошибка, обратитесь в поддержку."
+        )
+
+
+def get_secret_after_approval(payment):
+    if payment["payment_type"] == "purchase":
+        result = (
+            db.table("product_codes")
+            .select("secret_code")
+            .eq("order_id", payment["order_id"])
+            .limit(1)
+            .execute()
+        )
+        row = first_row(result.data)
+        return row.get("secret_code") if row else None
+
+    if payment["payment_type"] == "resale":
+        listing = (
+            db.table("resale_listings")
+            .select("good_id")
+            .eq("id", payment["listing_id"])
+            .limit(1)
+            .execute()
+        )
+        listing_row = first_row(listing.data)
+
+        if not listing_row:
+            return None
+
+        good = (
+            db.table("resale_goods")
+            .select("secret_code")
+            .eq("id", listing_row["good_id"])
+            .limit(1)
+            .execute()
+        )
+        good_row = first_row(good.data)
+        return good_row.get("secret_code") if good_row else None
+
+    return None
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("review_yes:") or c.data.startswith("review_no:")
+)
+def review_payment(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа.", show_alert=True)
+        return
+
+    approved = call.data.startswith("review_yes:")
+    payment_ref = call.data.split(":", 1)[1]
+
+    payment = get_payment(payment_ref)
+
+    if not payment:
+        bot.answer_callback_query(call.id, "Платёж не найден.", show_alert=True)
+        return
+
+    if payment["status"] != "payment_reported":
+        bot.answer_callback_query(
+            call.id,
+            "Платёж уже обработан или не ожидает проверки.",
+            show_alert=True
+        )
+        return
+
+    try:
+        # RPC сам выполняет атомарную проверку и изменение статусов.
+        rpc("review_crypto_payment", {
+            "p_payment_ref": payment_ref,
+            "p_admin_id": call.from_user.id,
+            "p_approve": approved
+        })
+
+        if approved:
+            # Код запрашивается только после успешного одобрения RPC.
+            secret = get_secret_after_approval(payment)
+            notify_payment_result(payment, True, secret)
+            result_text = "Оплата одобрена."
+        else:
+            notify_payment_result(payment, False)
+            result_text = "Оплата отклонена."
+
+        bot.answer_callback_query(call.id, result_text)
+
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=None
+            )
+        except Exception:
+            pass
+
+        bot.send_message(ADMIN_ID, result_text)
+
+    except Exception:
+        logging.exception("Ошибка проверки платежа")
+        bot.answer_callback_query(
+            call.id,
+            "Не удалось обработать платёж. Проверьте логи.",
+            show_alert=True
+        )
+
+
+# =========================================================
+# МОИ ЗАКАЗЫ
+# =========================================================
+
+@bot.message_handler(func=lambda m: m.text == "📦 Мои заказы")
+def my_orders(message):
+    user_id = message.from_user.id
+
+    result = (
+        db.table("orders")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(30)
+        .execute()
+    )
+
+    orders = result.data or []
+
+    if not orders:
+        bot.send_message(message.chat.id, "У вас пока нет заказов.")
+        return
+
+    lines = ["<b>📦 Ваши заказы</b>\n"]
+
+    for order in orders:
+        lines.append(
+            f"Заказ: <code>{esc(order['order_id'])}</code>\n"
+            f"Товар: {esc(order.get('product'))}\n"
+            f"Цена: {money(order.get('price'))} USDT\n"
+            f"Статус: {esc(order.get('status'))}\n"
+        )
+
+    bot.send_message(message.chat.id, "\n".join(lines))
+
+
+# =========================================================
+# ИСТОРИЯ ПЛАТЕЖЕЙ
+# =========================================================
+
+@bot.message_handler(func=lambda m: m.text == "💳 История платежей")
+def payment_history(message):
+    result = (
+        db.table("crypto_payments")
+        .select("payment_ref,payment_type,amount,status,created_at")
+        .eq("user_id", message.from_user.id)
+        .order("created_at", desc=True)
+        .limit(30)
+        .execute()
+    )
+
+    payments = result.data or []
+
+    if not payments:
+        bot.send_message(message.chat.id, "История платежей пока пуста.")
+        return
+
+    lines = ["<b>💳 История платежей</b>\n"]
+
+    for p in payments:
+        lines.append(
+            f"Платёж: <code>{esc(p['payment_ref'])}</code>\n"
+            f"Тип: {esc(p['payment_type'])}\n"
+            f"Сумма: {money(p['amount'])} USDT\n"
+            f"Статус: {esc(p['status'])}\n"
+        )
+
+    bot.send_message(message.chat.id, "\n".join(lines))
+
+
+# =========================================================
+# ПЕРЕПРОДАЖА
+# =========================================================
+
+@bot.callback_query_handler(func=lambda c: c.data == "resale_catalog")
+def resale_catalog(call):
+    bot.answer_callback_query(call.id)
+
+    listings_result = (
+        db.table("resale_listings")
+        .select("*")
+        .eq("status", "active")
+        .order("created_at", desc=True)
+        .limit(50)
+        .execute()
+    )
+
+    listings = listings_result.data or []
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    count = 0
+
+    for listing in listings:
+        # Не показываем объявления, для которых уже есть незавершённая оплата.
+        pending = (
+            db.table("crypto_payments")
+            .select("id")
+            .eq("listing_id", listing["id"])
+            .in_("status", ["awaiting_payment", "payment_reported"])
+            .limit(1)
+            .execute()
+        )
+
+        if pending.data:
+            continue
+
+        good_result = (
+            db.table("resale_goods")
+            .select("product_id,seller_id,status")
+            .eq("id", listing["good_id"])
+            .limit(1)
+            .execute()
+        )
+        good = first_row(good_result.data)
+
+        if not good or good["status"] != "listed":
+            continue
+
+        if int(good["seller_id"]) == call.from_user.id:
+            continue
+
+        product = get_product(good["product_id"])
+        if not product:
+            continue
+
+        markup.add(types.InlineKeyboardButton(
+            f"{product['name']} — {money(listing['asking_price'])} USDT",
+            callback_data=f"resale_buy:{listing['id']}"
+        ))
+        count += 1
+
+    markup.add(types.InlineKeyboardButton(
+        "➕ Выставить свой товар",
+        callback_data="resale_sell"
+    ))
 
     bot.send_message(
         call.message.chat.id,
-        "🏪 <b>Объявление</b>\n\n"
-        f"Товар: <b>{safe_text(product['name'])}</b>\n"
-        f"Цена: <b>{money_text(listing['asking_price'])} USDT</b>\n"
-        f"Комиссия магазина: <b>{COMMISSION:.0f}%</b>\n\n"
-        "Код будет отправлен покупателю после оплаты.",
-        parse_mode="HTML",
-        reply_markup=keyboard
+        f"<b>🔄 Перепродажа</b>\n\nДоступных объявлений: {count}\n"
+        "Оплата поступает на кошелёк магазина. Выплата продавцу производится администратором вручную.",
+        reply_markup=markup
     )
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("resale_buy:"))
 def resale_buy(call):
-    try:
-        listing_id = int(call.data.split(":", 1)[1])
-    except ValueError:
-        bot.answer_callback_query(call.id, "Некорректное объявление.")
-        return
-
-    listing = get_listing(listing_id)
-
-    if not listing:
-        bot.answer_callback_query(call.id, "Объявление недоступно.", show_alert=True)
-        return
-
-    if listing["seller_id"] == call.from_user.id:
-        bot.answer_callback_query(call.id, "Нельзя купить свой товар.", show_alert=True)
-        return
+    listing_id = int(call.data.split(":", 1)[1])
 
     try:
-        result = db.rpc(
-            "buy_resale_listing",
-            {
-                "p_listing_id": listing_id,
-                "p_buyer_id": call.from_user.id,
-                "p_commission_percent": str(COMMISSION)
-            }
-        ).execute()
+        data = rpc("create_resale_payment", {
+            "p_user_id": call.from_user.id,
+            "p_listing_id": listing_id
+        })
 
-        data = result.data
+        row = first_row(data)
 
-        if isinstance(data, list):
-            data = data[0] if data else {}
+        if not row:
+            bot.answer_callback_query(
+                call.id,
+                "Объявление недоступно.",
+                show_alert=True
+            )
+            return
 
-        if not isinstance(data, dict):
-            raise ValueError("Некорректный ответ базы")
+        payment_ref = row["payment_ref"]
+        price = row.get("amount") or row.get("asking_price")
 
-        secret_code = data.get("secret_code")
-        transaction_id = data.get("transaction_id", "—")
+        # Получаем актуальную сумму из созданного платежа.
+        payment = get_payment(payment_ref)
+        if payment:
+            price = payment["amount"]
 
-        if not secret_code:
-            raise ValueError("Код не найден")
-
-        bot.answer_callback_query(call.id, "Покупка успешна!")
+        bot.answer_callback_query(call.id, "Заказ на перепродажу создан.")
 
         bot.send_message(
-            call.from_user.id,
-            "✅ <b>Покупка на вторичном рынке успешна!</b>\n\n"
-            f"Операция: <code>{transaction_id}</code>\n\n"
-            "<b>Твой цифровой код:</b>\n"
-            f"<code>{safe_text(secret_code)}</code>",
-            parse_mode="HTML"
+            call.message.chat.id,
+            "<b>🧾 Покупка через перепродажу</b>\n\n"
+            f"Сумма: <b>{money(price)} USDT</b>\n"
+            f"Сеть: {NETWORK}\n"
+            f"Кошелёк:\n<code>{WALLET}</code>\n\n"
+            "После перевода нажмите «Я оплатил».\n"
+            "Код будет выдан только после проверки администратором.\n\n"
+            "Выплата продавцу производится администратором вручную.",
+            reply_markup=payment_keyboard(payment_ref)
         )
 
-        price = money(listing["asking_price"])
-
-        notify_user(
-            listing["seller_id"],
-            "💰 <b>Твой товар купили!</b>\n\n"
-            f"Объявление: <code>{listing_id}</code>\n"
-            f"Цена: {price:.2f} USDT\n"
-            f"Комиссия: {(price * COMMISSION / 100):.2f} USDT\n"
-            f"Твоё начисление: {(price * (100 - COMMISSION) / 100):.2f} USDT"
-        )
-
-    except Exception as error:
-        print("Ошибка вторичного рынка:", error)
+    except Exception:
+        logging.exception("Ошибка создания платежа перепродажи")
         bot.answer_callback_query(
             call.id,
-            "Покупка не состоялась. Возможно, объявление уже купили.",
+            "Не удалось создать платёж. Возможно, объявление уже куплено.",
             show_alert=True
         )
 
 
-# ==================================================
-# МОИ ОБЪЯВЛЕНИЯ
-# ==================================================
+# =========================================================
+# ПРОДАЖА СВОЕГО ТОВАРА
+# =========================================================
 
-@bot.message_handler(func=lambda m: m.text == "📋 Мои объявления")
-def my_resale_listings(message):
-    try:
-        listings = (
-            db.table("resale_listings")
-            .select("*")
-            .eq("seller_id", message.from_user.id)
-            .eq("status", "active")
-            .order("created_at", desc=True)
+@bot.callback_query_handler(func=lambda c: c.data == "resale_sell")
+def resale_sell_start(call):
+    user_id = call.from_user.id
+
+    result = (
+        db.table("orders")
+        .select("order_id,product,status")
+        .eq("user_id", user_id)
+        .eq("status", "Выдан покупателю")
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    orders = result.data or []
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    count = 0
+
+    for order in orders:
+        # Исключаем уже выставленные на перепродажу исходные заказы.
+        existing = (
+            db.table("resale_goods")
+            .select("id")
+            .eq("original_order_id", order["order_id"])
+            .limit(1)
             .execute()
-            .data or []
         )
-    except Exception as error:
-        print("Ошибка объявлений:", error)
-        bot.send_message(message.chat.id, "Не удалось загрузить объявления.")
-        return
 
-    if not listings:
-        bot.send_message(message.chat.id, "Активных объявлений нет.")
-        return
-
-    for listing in listings:
-        good = get_good(listing["good_id"])
-        product = get_resale_product(good)
-
-        if not good or not product:
+        if existing.data:
             continue
 
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton(
-            "❌ Снять объявление",
-            callback_data=f"resale_remove:{listing['id']}"
+        markup.add(types.InlineKeyboardButton(
+            f"{order.get('product')} — заказ {order['order_id']}",
+            callback_data=f"sell_order:{order['order_id']}"
         ))
+        count += 1
 
+    bot.answer_callback_query(call.id)
+
+    if count == 0:
         bot.send_message(
-            message.chat.id,
-            f"🛍 <b>{safe_text(product['name'])}</b>\n"
-            f"Цена: <b>{money_text(listing['asking_price'])} USDT</b>",
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("resale_remove:"))
-def resale_remove(call):
-    try:
-        listing_id = int(call.data.split(":", 1)[1])
-    except ValueError:
-        bot.answer_callback_query(call.id, "Некорректный номер.")
-        return
-
-    listing = get_listing(listing_id)
-
-    if not listing or listing["seller_id"] != call.from_user.id:
-        bot.answer_callback_query(call.id, "Объявление не найдено.", show_alert=True)
-        return
-
-    try:
-        db.table("resale_listings").update({
-            "status": "removed"
-        }).eq("id", listing_id).eq(
-            "seller_id", call.from_user.id
-        ).execute()
-
-        db.table("resale_goods").update({
-            "status": "removed"
-        }).eq("id", listing["good_id"]).eq(
-            "seller_id", call.from_user.id
-        ).execute()
-
-        bot.answer_callback_query(call.id, "Объявление снято.")
-        bot.send_message(call.message.chat.id, "✅ Объявление снято.")
-
-    except Exception as error:
-        print("Ошибка снятия объявления:", error)
-        bot.answer_callback_query(call.id, "Ошибка.", show_alert=True)
-
-
-# ==================================================
-# ПРОДАЖА ТОВАРА
-# ==================================================
-
-@bot.message_handler(func=lambda m: m.text == "🔄 Продать товар")
-def resale_start(message):
-    user_id = message.from_user.id
-    save_user(message.from_user)
-
-    try:
-        orders = (
-            db.table("orders")
-            .select("*")
-            .eq("user_id", user_id)
-            .eq("status", "Выдан покупателю")
-            .order("created_at", desc=True)
-            .execute()
-            .data or []
-        )
-
-        used_goods = (
-            db.table("resale_goods")
-            .select("original_order_id")
-            .eq("seller_id", user_id)
-            .execute()
-            .data or []
-        )
-
-        used_ids = {
-            item["original_order_id"] for item in used_goods
-        }
-
-    except Exception as error:
-        print("Ошибка заказов перепродажи:", error)
-        bot.send_message(message.chat.id, "Не удалось загрузить заказы.")
-        return
-
-    available = [
-        order for order in orders
-        if order.get("order_id") not in used_ids
-    ]
-
-    keyboard = types.InlineKeyboardMarkup()
-
-    for order in available[:20]:
-        product = next(
-            (
-                p for p in get_products()
-                if p["name"] == order.get("product")
-            ),
-            None
-        )
-
-        if product and product.get("resale_allowed", False):
-            keyboard.add(types.InlineKeyboardButton(
-                f"{product['name']} — {order['order_id']}",
-                callback_data=f"resale_order:{order['order_id']}"
-            ))
-
-    if not keyboard.keyboard:
-        bot.send_message(
-            message.chat.id,
-            "Нет заказов с разрешённой перепродажей.\n"
-            "Администратор должен разрешить перепродажу соответствующих товаров."
+            call.message.chat.id,
+            "У вас нет доступных заказов для перепродажи.\n"
+            "Выставить можно только товар, который был выдан вам ранее."
         )
         return
 
     bot.send_message(
-        message.chat.id,
-        "🔄 <b>Выбери заказ для продажи:</b>",
-        parse_mode="HTML",
-        reply_markup=keyboard
+        call.message.chat.id,
+        "Выберите заказ, товар из которого хотите выставить на перепродажу:",
+        reply_markup=markup
     )
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("resale_order:"))
-def resale_select_order(call):
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sell_order:"))
+def resale_set_price(call):
     order_id = call.data.split(":", 1)[1]
-    order = get_order(order_id)
 
-    if not order or order.get("user_id") != call.from_user.id:
-        bot.answer_callback_query(call.id, "Заказ не найден.", show_alert=True)
-        return
-
-    if order.get("status") != "Выдан покупателю":
-        bot.answer_callback_query(call.id, "Заказ ещё не выдан.", show_alert=True)
-        return
-
-    product = next(
-        (
-            p for p in get_products()
-            if p["name"] == order.get("product")
-        ),
-        None
-    )
-
-    if not product or not product.get("resale_allowed", False):
-        bot.answer_callback_query(call.id, "Перепродажа запрещена.", show_alert=True)
-        return
-
-    resale_states[call.from_user.id] = {
-        "step": "code",
+    states[call.from_user.id] = {
+        "action": "resale_price",
         "order_id": order_id
     }
 
     bot.answer_callback_query(call.id)
-
     bot.send_message(
         call.message.chat.id,
-        "🔐 <b>Продажа товара</b>\n\n"
-        "Отправь цифровой код товара одним сообщением.\n"
-        "Затем укажи цену.\n\n"
-        "Не отправляй пароли или данные от аккаунтов.\n"
-        "Для отмены: /cancel_resale",
-        parse_mode="HTML"
-    )
-
-
-@bot.message_handler(commands=["cancel_resale"])
-def cancel_resale(message):
-    resale_states.pop(message.from_user.id, None)
-
-    bot.send_message(
-        message.chat.id,
-        "Продажа отменена.",
-        reply_markup=main_menu(message.from_user.id)
+        "Введите цену перепродажи в USDT (например, 25.50).\n"
+        "Для отмены отправьте /cancel."
     )
 
 
 @bot.message_handler(
-    func=lambda m: m.from_user.id in resale_states
-    and bool(m.text)
-    and not m.text.startswith("/")
+    func=lambda m: states.get(m.from_user.id, {}).get("action") == "resale_price"
 )
-def process_resale_input(message):
+def receive_resale_price(message):
     user_id = message.from_user.id
-    state = resale_states.get(user_id)
+    state = states.get(user_id, {})
 
-    if not state:
+    try:
+        price = Decimal(message.text.strip().replace(",", "."))
+        if price <= 0 or price > Decimal("100000000"):
+            raise InvalidOperation
+    except (InvalidOperation, AttributeError):
+        bot.send_message(message.chat.id, "Введите корректную цену, например 25.50.")
         return
 
-    if message.text == "Отмена":
-        resale_states.pop(user_id, None)
-        bot.send_message(message.chat.id, "Продажа отменена.")
-        return
+    try:
+        data = rpc("create_resale_listing", {
+            "p_order_id": state["order_id"],
+            "p_seller_id": user_id,
+            "p_price": float(price)
+        })
 
-    if state["step"] == "code":
-        code = message.text.strip()
+        row = first_row(data)
 
-        if len(code) < 4 or len(code) > 500:
-            bot.send_message(message.chat.id, "Некорректная длина кода.")
+        clear_state(user_id)
+
+        if not row:
+            bot.send_message(
+                message.chat.id,
+                "Не удалось создать объявление. Проверьте, разрешена ли перепродажа этого товара."
+            )
             return
-
-        state["secret_code"] = code
-        state["step"] = "price"
 
         bot.send_message(
             message.chat.id,
-            "💰 Отправь цену в USDT. Например: <code>15</code>",
-            parse_mode="HTML"
+            "<b>✅ Объявление создано</b>\n\n"
+            f"Товар: {esc(row.get('product_name'))}\n"
+            f"Цена: {money(row.get('asking_price', price))} USDT\n"
+            "Секретный код взят из первоначального заказа автоматически.\n"
+            "Комиссия магазина: 0%."
         )
-        return
 
-    if state["step"] == "price":
-        try:
-            price = Decimal(message.text.replace(",", ".").strip())
-
-            if price <= 0 or price > Decimal("100000"):
-                raise ValueError
-
-            price = price.quantize(Decimal("0.01"))
-
-        except (InvalidOperation, ValueError):
-            bot.send_message(message.chat.id, "Некорректная цена.")
-            return
-
-        try:
-            result = db.rpc(
-                "create_resale_listing",
-                {
-                    "p_order_id": state["order_id"],
-                    "p_seller_id": user_id,
-                    "p_secret_code": state["secret_code"],
-                    "p_price": str(price)
-                }
-            ).execute()
-
-            listing_id = result.data
-            resale_states.pop(user_id, None)
-
-            bot.send_message(
-                message.chat.id,
-                "✅ <b>Товар выставлен!</b>\n\n"
-                f"Объявление: <code>{listing_id}</code>\n"
-                f"Цена: {price:.2f} USDT\n"
-                f"Комиссия: {COMMISSION:.0f}%\n"
-                f"После продажи получишь: "
-                f"{(price * (100 - COMMISSION) / 100):.2f} USDT",
-                parse_mode="HTML",
-                reply_markup=main_menu(user_id)
-            )
-
-        except Exception as error:
-            print("Ошибка создания объявления:", error)
-            resale_states.pop(user_id, None)
-
-            bot.send_message(
-                message.chat.id,
-                "❌ Не удалось создать объявление. Проверь разрешение на перепродажу.",
-                reply_markup=main_menu(user_id)
-            )
+    except Exception:
+        logging.exception("Ошибка создания объявления")
+        clear_state(user_id)
+        bot.send_message(
+            message.chat.id,
+            "Не удалось выставить товар. Возможно, он уже выставлен или перепродажа запрещена."
+        )
 
 
-# ==================================================
+# =========================================================
 # ПОДДЕРЖКА
-# ==================================================
+# =========================================================
 
-@bot.message_handler(func=lambda m: m.text == "💬 Поддержка")
+@bot.message_handler(func=lambda m: m.text == "🆘 Поддержка")
 def support_start(message):
-    support_waiting.add(message.from_user.id)
-
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add("Отмена")
-
+    states[message.from_user.id] = {"action": "support"}
     bot.send_message(
         message.chat.id,
-        "💬 Напиши сообщение администратору.",
-        reply_markup=keyboard
+        "Напишите сообщение для поддержки. Оно будет передано администратору.\n"
+        "Для отмены отправьте /cancel."
     )
 
 
 @bot.message_handler(
-    func=lambda m: m.from_user.id in support_waiting
-    and bool(m.text)
-    and m.text != "Отмена"
+    func=lambda m: states.get(m.from_user.id, {}).get("action") == "support"
 )
 def support_message(message):
-    user = message.from_user
-    save_user(user)
+    user_id = message.from_user.id
+    text = message.text or ""
 
-    bot.send_message(
-        ADMIN_ID,
-        "💬 <b>Сообщение в поддержку</b>\n\n"
-        f"Пользователь: {safe_text(user.first_name)}\n"
-        f"ID: <code>{user.id}</code>\n\n"
-        f"{safe_text(message.text)}",
-        parse_mode="HTML"
-    )
-
-    support_waiting.discard(user.id)
-
-    bot.send_message(
-        message.chat.id,
-        "✅ Сообщение отправлено.",
-        reply_markup=main_menu(user.id)
-    )
-
-
-@bot.message_handler(func=lambda m: m.text == "Отмена")
-def support_cancel(message):
-    support_waiting.discard(message.from_user.id)
-    topup_waiting.discard(message.from_user.id)
-    resale_states.pop(message.from_user.id, None)
-
-    bot.send_message(
-        message.chat.id,
-        "Действие отменено.",
-        reply_markup=main_menu(message.from_user.id)
-    )
-
-
-# ==================================================
-# АДМИН-ПАНЕЛЬ
-# ==================================================
-
-def admin_panel(chat_id):
-    keyboard = types.InlineKeyboardMarkup()
-
-    buttons = [
-        ("💰 Управление балансами", "admin_balances"),
-        ("🛍 Управление товарами", "manage_products"),
-        ("📋 Заказы", "admin_orders"),
-        ("👥 Покупатели", "admin_users"),
-        ("📊 Статистика", "admin_stats")
-    ]
-
-    for title, callback in buttons:
-        keyboard.add(types.InlineKeyboardButton(
-            title,
-            callback_data=callback
-        ))
-
-    bot.send_message(
-        chat_id,
-        "⚙️ <b>Админ-панель</b>",
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
-
-
-@bot.message_handler(commands=["admin"])
-def admin_command(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "⛔ Нет доступа.")
+    if not text.strip():
+        bot.send_message(message.chat.id, "Отправьте текстовое сообщение.")
         return
 
-    admin_panel(message.chat.id)
+    sent = bot.send_message(
+        ADMIN_ID,
+        "<b>🆘 Обращение в поддержку</b>\n\n"
+        f"Пользователь: <code>{user_id}</code>\n"
+        f"Имя: {esc(message.from_user.first_name)}\n"
+        f"Username: @{esc(message.from_user.username or 'не указан')}\n\n"
+        f"{esc(text)}\n\n"
+        f"Чтобы ответить, отправьте:\n"
+        f"<code>/reply {user_id} текст ответа</code>"
+    )
 
+    support_replies[sent.message_id] = user_id
+    clear_state(user_id)
+
+    bot.send_message(
+        message.chat.id,
+        "✅ Сообщение передано администратору."
+    )
+
+
+@bot.message_handler(commands=["reply"])
+def support_reply(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = message.text.split(maxsplit=2)
+
+    if len(parts) < 3:
+        bot.reply_to(message, "Формат: /reply USER_ID текст ответа")
+        return
+
+    try:
+        user_id = int(parts[1])
+        answer = parts[2]
+        bot.send_message(
+            user_id,
+            "💬 <b>Ответ поддержки</b>\n\n" + esc(answer)
+        )
+        bot.reply_to(message, "Ответ отправлен.")
+    except Exception:
+        bot.reply_to(message, "Не удалось отправить ответ.")
+
+
+# =========================================================
+# АДМИН-ПАНЕЛЬ
+# =========================================================
 
 @bot.message_handler(func=lambda m: m.text == "⚙️ Админ-панель")
-def admin_button(message):
-    if is_admin(message.from_user.id):
-        admin_panel(message.chat.id)
-
-
-# ==================================================
-# УПРАВЛЕНИЕ БАЛАНСАМИ
-# ==================================================
-
-@bot.callback_query_handler(func=lambda c: c.data == "admin_balances")
-def admin_balances(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа.")
-        return
-
-    bot.answer_callback_query(call.id)
-
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton(
-        "➕ Начислить / списать",
-        callback_data="balance_adjust"
-    ))
-    keyboard.add(types.InlineKeyboardButton(
-        "👤 Посмотреть баланс",
-        callback_data="balance_lookup"
-    ))
-    keyboard.add(types.InlineKeyboardButton(
-        "⬅️ Назад",
-        callback_data="admin_back"
-    ))
-
-    bot.send_message(
-        ADMIN_ID,
-        "💰 <b>Управление балансами</b>",
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "balance_adjust")
-def balance_adjust_start(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа.")
-        return
-
-    bot.answer_callback_query(call.id)
-    admin_states[ADMIN_ID] = {"action": "balance_adjust"}
-
-    bot.send_message(
-        ADMIN_ID,
-        "Отправь Telegram ID и сумму через |.\n\n"
-        "Пример: <code>123456789 | 25</code>\n"
-        "Списание: <code>123456789 | -5</code>\n"
-        "Отмена: /cancel",
-        parse_mode="HTML"
-    )
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "balance_lookup")
-def balance_lookup_start(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа.")
-        return
-
-    bot.answer_callback_query(call.id)
-    admin_states[ADMIN_ID] = {"action": "balance_lookup"}
-
-    bot.send_message(ADMIN_ID, "Отправь Telegram ID покупателя.")
-
-
-# ==================================================
-# УПРАВЛЕНИЕ ТОВАРАМИ
-# ==================================================
-
-def show_manage_products(chat_id):
-    keyboard = types.InlineKeyboardMarkup()
-
-    keyboard.add(types.InlineKeyboardButton(
-        "➕ Добавить товар",
-        callback_data="add_product"
-    ))
-
-    for product in get_products():
-        status = "🟢" if product.get("active") else "🔴"
-
-        keyboard.add(types.InlineKeyboardButton(
-            f"{status} {product['name']}",
-            callback_data=f"manage:{product['product_id']}"
-        ))
-
-    keyboard.add(types.InlineKeyboardButton(
-        "⬅️ Назад",
-        callback_data="admin_back"
-    ))
-
-    bot.send_message(
-        chat_id,
-        "🛍 <b>Управление товарами</b>\n\n"
-        "🟢 — активен\n🔴 — скрыт",
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "manage_products")
-def manage_products(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа.")
-        return
-
-    bot.answer_callback_query(call.id)
-    show_manage_products(ADMIN_ID)
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "admin_back")
-def admin_back(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа.")
-        return
-
-    bot.answer_callback_query(call.id)
-    admin_panel(ADMIN_ID)
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("manage:"))
-def manage_one_product(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа.")
-        return
-
-    bot.answer_callback_query(call.id)
-
-    product_id = call.data.split(":", 1)[1]
-    product = get_product(product_id)
-
-    if not product:
-        bot.send_message(ADMIN_ID, "Товар не найден.")
-        return
-
-    stock = get_stock_count(product_id)
-
-    status = "🟢 Активен" if product.get("active") else "🔴 Скрыт"
-    resale_status = (
-        "✅ Разрешена"
-        if product.get("resale_allowed")
-        else "❌ Запрещена"
-    )
-
-    keyboard = types.InlineKeyboardMarkup()
-
-    keyboard.add(types.InlineKeyboardButton(
-        "📦 Добавить цифровые коды",
-        callback_data=f"stock_add:{product_id}"
-    ))
-
-    keyboard.add(types.InlineKeyboardButton(
-        "📊 Посмотреть остаток",
-        callback_data=f"stock_view:{product_id}"
-    ))
-
-    keyboard.add(types.InlineKeyboardButton(
-        "✏️ Изменить цену",
-        callback_data=f"price:{product_id}"
-    ))
-
-    keyboard.add(types.InlineKeyboardButton(
-        "🔄 Включить / выключить",
-        callback_data=f"toggle:{product_id}"
-    ))
-
-    keyboard.add(types.InlineKeyboardButton(
-        "🗑 Скрыть товар",
-        callback_data=f"delete:{product_id}"
-    ))
-
-    keyboard.add(types.InlineKeyboardButton(
-        "⬅️ К товарам",
-        callback_data="manage_products"
-    ))
-
-    bot.send_message(
-        ADMIN_ID,
-        f"🛍 <b>{safe_text(product['name'])}</b>\n\n"
-        f"Цена: {money_text(product['price'])} USDT\n"
-        f"Остаток: <b>{stock}</b>\n"
-        f"Статус: {status}\n"
-        f"Перепродажа: {resale_status}\n"
-        f"Описание: {safe_text(product.get('description'))}",
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
-
-
-# ==================================================
-# СКЛАД: ДОБАВЛЕНИЕ И ПРОСМОТР
-# ==================================================
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("stock_add:"))
-def stock_add_start(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа.")
-        return
-
-    product_id = call.data.split(":", 1)[1]
-    product = get_product(product_id)
-
-    if not product:
-        bot.answer_callback_query(call.id, "Товар не найден.")
-        return
-
-    bot.answer_callback_query(call.id)
-
-    admin_states[ADMIN_ID] = {
-        "action": "stock_add",
-        "product_id": product_id
-    }
-
-    bot.send_message(
-        ADMIN_ID,
-        "📦 <b>Добавление цифровых кодов</b>\n\n"
-        f"Товар: <b>{safe_text(product['name'])}</b>\n\n"
-        "Отправь коды одним сообщением, каждый с новой строки.\n\n"
-        "Отмена: /cancel",
-        parse_mode="HTML"
-    )
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("stock_view:"))
-def stock_view(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа.")
-        return
-
-    product_id = call.data.split(":", 1)[1]
-    product = get_product(product_id)
-
-    if not product:
-        bot.answer_callback_query(call.id, "Товар не найден.")
-        return
-
-    count = get_stock_count(product_id)
-
-    bot.answer_callback_query(call.id)
-
-    bot.send_message(
-        ADMIN_ID,
-        "📊 <b>Остаток товара</b>\n\n"
-        f"Товар: {safe_text(product['name'])}\n"
-        f"Доступно кодов: <b>{count}</b>",
-        parse_mode="HTML"
-    )
-
-
-# ==================================================
-# ИЗМЕНЕНИЕ ЦЕНЫ И СТАТУСА
-# ==================================================
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("price:"))
-def start_price_change(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа.")
-        return
-
-    bot.answer_callback_query(call.id)
-
-    product_id = call.data.split(":", 1)[1]
-
-    admin_states[ADMIN_ID] = {
-        "action": "price",
-        "product_id": product_id
-    }
-
-    bot.send_message(ADMIN_ID, "Введи новую цену. Отмена: /cancel")
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("toggle:"))
-def toggle_product_callback(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа.")
-        return
-
-    product_id = call.data.split(":", 1)[1]
-    product = get_product(product_id)
-
-    if not product:
-        bot.answer_callback_query(call.id, "Товар не найден.")
-        return
-
-    if toggle_product(product_id, not product.get("active", False)):
-        bot.answer_callback_query(call.id, "Статус изменён.")
-        show_manage_products(ADMIN_ID)
-    else:
-        bot.answer_callback_query(call.id, "Ошибка.")
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("delete:"))
-def delete_product_callback(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа.")
-        return
-
-    product_id = call.data.split(":", 1)[1]
-
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.row(
-        types.InlineKeyboardButton(
-            "Да, скрыть",
-            callback_data=f"delete_yes:{product_id}"
-        ),
-        types.InlineKeyboardButton(
-            "Отмена",
-            callback_data="manage_products"
-        )
-    )
-
-    bot.answer_callback_query(call.id)
-    bot.send_message(ADMIN_ID, "Скрыть товар из каталога?", reply_markup=keyboard)
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("delete_yes:"))
-def delete_product_confirm(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа.")
-        return
-
-    product_id = call.data.split(":", 1)[1]
-
-    if delete_product(product_id):
-        bot.answer_callback_query(call.id, "Товар скрыт.")
-        show_manage_products(ADMIN_ID)
-    else:
-        bot.answer_callback_query(call.id, "Ошибка.")
-
-
-# ==================================================
-# ДОБАВЛЕНИЕ ТОВАРА
-# ==================================================
-
-@bot.callback_query_handler(func=lambda c: c.data == "add_product")
-def start_add_product(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа.")
-        return
-
-    bot.answer_callback_query(call.id)
-    admin_states[ADMIN_ID] = {"action": "add_product"}
-
-    bot.send_message(
-        ADMIN_ID,
-        "➕ <b>Добавление товара</b>\n\n"
-        "Формат:\n"
-        "<code>games | Название | 10 | Описание</code>\n\n"
-        "Категории: gifts, games, subs\n"
-        "Отмена: /cancel",
-        parse_mode="HTML"
-    )
-
-
-# ==================================================
-# ОБРАБОТКА АДМИНСКИХ СООБЩЕНИЙ
-# ==================================================
-
-@bot.message_handler(commands=["cancel"])
-def cancel_admin_action(message):
+def admin_panel(message):
     if not is_admin(message.from_user.id):
         return
 
-    admin_states.pop(ADMIN_ID, None)
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("📦 Управление товарами", callback_data="admin_products"),
+        types.InlineKeyboardButton("💳 Ожидающие оплаты", callback_data="admin_payments")
+    )
 
     bot.send_message(
-        ADMIN_ID,
-        "Действие отменено.",
-        reply_markup=main_menu(ADMIN_ID)
+        message.chat.id,
+        "<b>⚙️ Панель администратора</b>",
+        reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_products")
+def admin_products(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа.", show_alert=True)
+        return
+
+    result = (
+        db.table("products")
+        .select("product_id,name,price,active")
+        .order("name")
+        .execute()
+    )
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    for p in result.data or []:
+        status = "🟢" if p["active"] else "🔴"
+        markup.add(types.InlineKeyboardButton(
+            f"{status} {p['name']} ({money(p['price'])} USDT)",
+            callback_data=f"admin_edit:{p['product_id']}"
+        ))
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        "<b>📦 Выберите товар для редактирования:</b>",
+        reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admin_edit:"))
+def admin_edit_product(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа.", show_alert=True)
+        return
+
+    product_id = call.data.split(":", 1)[1]
+    product = get_product(product_id)
+
+    if not product:
+        bot.answer_callback_query(call.id, "Товар не найден.")
+        return
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    fields = [
+        ("name", "Название"),
+        ("category", "Категория"),
+        ("price", "Цена USDT"),
+        ("description", "Описание"),
+        ("origin_status", "Происхождение"),
+        ("owner_status", "Владелец"),
+        ("transfer_status", "Передача"),
+        ("verification_info", "Сведения для проверки"),
+        ("active", "Активность"),
+        ("resale_allowed", "Разрешить перепродажу")
+    ]
+
+    for field, label in fields:
+        markup.add(types.InlineKeyboardButton(
+            f"Изменить: {label}",
+            callback_data=f"editfield:{product_id}:{field}"
+        ))
+
+    markup.add(types.InlineKeyboardButton(
+        "➕ Добавить секретный код",
+        callback_data=f"addcode:{product_id}"
+    ))
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        f"<b>Редактирование товара:</b> {esc(product['name'])}\n"
+        f"ID: <code>{esc(product_id)}</code>",
+        reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("editfield:"))
+def admin_edit_field(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа.", show_alert=True)
+        return
+
+    _, product_id, field = call.data.split(":", 2)
+
+    allowed = {
+        "name", "category", "price", "description",
+        "origin_status", "owner_status", "transfer_status",
+        "verification_info", "active", "resale_allowed"
+    }
+
+    if field not in allowed:
+        bot.answer_callback_query(call.id, "Недопустимое поле.")
+        return
+
+    states[call.from_user.id] = {
+        "action": "admin_edit",
+        "product_id": product_id,
+        "field": field
+    }
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        f"Введите новое значение для поля <b>{field}</b>.\n"
+        "Для отмены отправьте /cancel."
     )
 
 
 @bot.message_handler(
-    func=lambda m: is_admin(m.from_user.id)
-    and m.from_user.id in admin_states
-    and bool(m.text)
+    func=lambda m: states.get(m.from_user.id, {}).get("action") == "admin_edit"
 )
-def process_admin_action(message):
-    state = admin_states.get(ADMIN_ID)
-
-    if not state:
+def admin_save_field(message):
+    if not is_admin(message.from_user.id):
+        clear_state(message.from_user.id)
         return
 
-    action = state["action"]
+    state = states[message.from_user.id]
+    field = state["field"]
+    value = (message.text or "").strip()
 
-    # ЗАГРУЗКА КОДОВ
-    if action == "stock_add":
-        product_id = state["product_id"]
+    if not value:
+        bot.send_message(message.chat.id, "Значение не должно быть пустым.")
+        return
 
-        codes = [
-            line.strip()
-            for line in message.text.splitlines()
-            if line.strip()
-        ]
+    try:
+        if field == "price":
+            value = float(Decimal(value.replace(",", ".")))
+            if value <= 0:
+                raise ValueError("Цена должна быть больше нуля.")
 
-        if not codes:
-            bot.send_message(ADMIN_ID, "Коды не найдены.")
-            return
+        elif field in ("active", "resale_allowed"):
+            normalized = value.lower()
+            if normalized in ("да", "yes", "true", "1", "on"):
+                value = True
+            elif normalized in ("нет", "no", "false", "0", "off"):
+                value = False
+            else:
+                bot.send_message(message.chat.id, "Введите «да» или «нет».")
+                return
 
-        if len(codes) > 500:
-            bot.send_message(ADMIN_ID, "Максимум 500 кодов за раз.")
-            return
+        db.table("products").update({
+            field: value
+        }).eq("product_id", state["product_id"]).execute()
 
-        if any(len(code) > 500 for code in codes):
-            bot.send_message(ADMIN_ID, "Один из кодов слишком длинный.")
-            return
+        clear_state(message.from_user.id)
+        bot.send_message(message.chat.id, "✅ Информация о товаре обновлена.")
 
-        added, duplicates, errors = add_product_codes(product_id, codes)
+    except Exception:
+        logging.exception("Ошибка редактирования товара")
+        bot.send_message(message.chat.id, "Не удалось обновить поле. Проверьте значение.")
 
-        admin_states.pop(ADMIN_ID, None)
 
+# =========================================================
+# ДОБАВЛЕНИЕ СЕКРЕТНЫХ КОДОВ
+# =========================================================
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("addcode:"))
+def admin_add_code_start(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа.", show_alert=True)
+        return
+
+    product_id = call.data.split(":", 1)[1]
+
+    states[call.from_user.id] = {
+        "action": "admin_add_code",
+        "product_id": product_id
+    }
+
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        "Отправьте секретный код одним сообщением.\n"
+        "Для отмены отправьте /cancel."
+    )
+
+
+@bot.message_handler(
+    func=lambda m: states.get(m.from_user.id, {}).get("action") == "admin_add_code"
+)
+def admin_add_code(message):
+    if not is_admin(message.from_user.id):
+        clear_state(message.from_user.id)
+        return
+
+    product_id = states[message.from_user.id]["product_id"]
+    code = (message.text or "").strip()
+
+    if not code:
+        bot.send_message(message.chat.id, "Код не должен быть пустым.")
+        return
+
+    try:
+        db.table("product_codes").insert({
+            "product_id": product_id,
+            "secret_code": code,
+            "status": "available"
+        }).execute()
+
+        clear_state(message.from_user.id)
+        bot.send_message(message.chat.id, "✅ Секретный код добавлен на склад.")
+
+    except Exception:
+        logging.exception("Ошибка добавления кода")
         bot.send_message(
-            ADMIN_ID,
-            "✅ <b>Загрузка завершена</b>\n\n"
-            f"Добавлено: <b>{added}</b>\n"
-            f"Дубликатов: <b>{duplicates}</b>\n"
-            f"Ошибок: <b>{errors}</b>\n"
-            f"Остаток: <b>{get_stock_count(product_id)}</b>",
-            parse_mode="HTML"
+            message.chat.id,
+            "Не удалось добавить код. Возможно, такой код уже существует."
         )
 
-    # ИЗМЕНЕНИЕ БАЛАНСА
-    elif action == "balance_adjust":
-        parts = message.text.split("|")
 
-        if len(parts) != 2:
-            bot.send_message(ADMIN_ID, "Формат: Telegram ID | сумма")
-            return
+# =========================================================
+# СПИСОК ОЖИДАЮЩИХ ОПЛАТ
+# =========================================================
 
-        try:
-            target_id = int(parts[0].strip())
-            amount = Decimal(
-                parts[1].strip().replace(",", ".")
-            ).quantize(Decimal("0.01"))
-
-            if target_id <= 0 or amount == 0:
-                raise ValueError
-
-        except (ValueError, InvalidOperation):
-            bot.send_message(ADMIN_ID, "Проверь ID и сумму.")
-            return
-
-        try:
-            result = db.rpc(
-                "admin_adjust_balance",
-                {
-                    "p_user_id": target_id,
-                    "p_amount": str(amount),
-                    "p_admin_id": ADMIN_ID,
-                    "p_description": "Корректировка администратором"
-                }
-            ).execute()
-
-            new_balance = money(result.data)
-            admin_states.pop(ADMIN_ID, None)
-
-            bot.send_message(
-                ADMIN_ID,
-                "✅ <b>Баланс изменён</b>\n\n"
-                f"Покупатель: <code>{target_id}</code>\n"
-                f"Операция: {amount:+.2f} USDT\n"
-                f"Новый баланс: {new_balance:.2f} USDT",
-                parse_mode="HTML"
-            )
-
-            notify_user(
-                target_id,
-                "💰 <b>Изменение баланса</b>\n\n"
-                f"Операция: {amount:+.2f} USDT\n"
-                f"Новый баланс: {new_balance:.2f} USDT"
-            )
-
-        except Exception as error:
-            print("Ошибка баланса:", error)
-            bot.send_message(ADMIN_ID, "Не удалось изменить баланс.")
-
-    # ПОИСК БАЛАНСА
-    elif action == "balance_lookup":
-        try:
-            target_id = int(message.text.strip())
-        except ValueError:
-            bot.send_message(ADMIN_ID, "Введи корректный ID.")
-            return
-
-        user = get_user_record(target_id)
-
-        if not user:
-            bot.send_message(ADMIN_ID, "Покупатель не найден.")
-            return
-
-        admin_states.pop(ADMIN_ID, None)
-
-        bot.send_message(
-            ADMIN_ID,
-            "👤 <b>Покупатель</b>\n\n"
-            f"ID: <code>{target_id}</code>\n"
-            f"Имя: {safe_text(user.get('first_name'))}\n"
-            f"Баланс: {money_text(user.get('balance', 0))} USDT\n"
-            f"Покупок: {user.get('purchased_count', 0)}",
-            parse_mode="HTML"
-        )
-
-    # ИЗМЕНЕНИЕ ЦЕНЫ
-    elif action == "price":
-        try:
-            price = Decimal(message.text.replace(",", ".").strip())
-
-            if price <= 0:
-                raise ValueError
-
-        except (ValueError, InvalidOperation):
-            bot.send_message(ADMIN_ID, "Введи положительную цену.")
-            return
-
-        if change_price(state["product_id"], price):
-            admin_states.pop(ADMIN_ID, None)
-            bot.send_message(ADMIN_ID, f"✅ Цена изменена: {price:.2f} USDT")
-        else:
-            bot.send_message(ADMIN_ID, "Не удалось изменить цену.")
-
-    # ДОБАВЛЕНИЕ ТОВАРА
-    elif action == "add_product":
-        parts = [p.strip() for p in message.text.split("|", 3)]
-
-        if len(parts) != 4:
-            bot.send_message(
-                ADMIN_ID,
-                "Формат: games | Название | 10 | Описание"
-            )
-            return
-
-        category, name, price_text, description = parts
-
-        if category not in CATEGORIES or not name or not description:
-            bot.send_message(ADMIN_ID, "Проверь данные товара.")
-            return
-
-        try:
-            price = Decimal(price_text.replace(",", "."))
-
-            if price <= 0:
-                raise ValueError
-
-        except (ValueError, InvalidOperation):
-            bot.send_message(ADMIN_ID, "Некорректная цена.")
-            return
-
-        product_id = "item_" + uuid.uuid4().hex[:12]
-
-        if add_product(product_id, category, name, price, description):
-            admin_states.pop(ADMIN_ID, None)
-            bot.send_message(ADMIN_ID, f"✅ Товар добавлен: {name}")
-            show_manage_products(ADMIN_ID)
-        else:
-            bot.send_message(ADMIN_ID, "Не удалось добавить товар.")
-
-
-# ==================================================
-# ЗАКАЗЫ АДМИНИСТРАТОРА
-# ==================================================
-
-@bot.callback_query_handler(func=lambda c: c.data == "admin_orders")
-def admin_orders(call):
+@bot.callback_query_handler(func=lambda c: c.data == "admin_payments")
+def admin_payments(call):
     if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа.")
+        bot.answer_callback_query(call.id, "Нет доступа.", show_alert=True)
         return
+
+    result = (
+        db.table("crypto_payments")
+        .select("*")
+        .eq("status", "payment_reported")
+        .order("reported_at", desc=True)
+        .limit(30)
+        .execute()
+    )
+
+    payments = result.data or []
 
     bot.answer_callback_query(call.id)
 
-    try:
-        orders = (
-            db.table("orders")
-            .select("*")
-            .order("created_at", desc=True)
-            .limit(20)
-            .execute()
-            .data or []
-        )
-
-        if not orders:
-            bot.send_message(ADMIN_ID, "Заказов пока нет.")
-            return
-
-        for order in orders:
-            bot.send_message(
-                ADMIN_ID,
-                "📋 <b>Заказ</b>\n"
-                f"Номер: <code>{safe_text(order.get('order_id'))}</code>\n"
-                f"Покупатель: <code>{order.get('user_id')}</code>\n"
-                f"Товар: {safe_text(order.get('product'))}\n"
-                f"Цена: {money_text(order.get('price'))} USDT\n"
-                f"Статус: {safe_text(order.get('status'))}",
-                parse_mode="HTML"
-            )
-
-    except Exception as error:
-        print("Ошибка заказов:", error)
-        bot.send_message(ADMIN_ID, "Не удалось загрузить заказы.")
-
-
-# ==================================================
-# ПОКУПАТЕЛИ
-# ==================================================
-
-@bot.callback_query_handler(func=lambda c: c.data == "admin_users")
-def admin_users(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа.")
+    if not payments:
+        bot.send_message(call.message.chat.id, "Нет платежей, ожидающих проверки.")
         return
 
-    bot.answer_callback_query(call.id)
-
-    try:
-        users = (
-            db.table("users")
-            .select("*")
-            .order("user_id")
-            .limit(30)
-            .execute()
-            .data or []
+    for p in payments:
+        text = (
+            "<b>💳 Платёж ожидает проверки</b>\n\n"
+            f"Платёж: <code>{esc(p['payment_ref'])}</code>\n"
+            f"Пользователь: <code>{p['user_id']}</code>\n"
+            f"Тип: {esc(p['payment_type'])}\n"
+            f"Сумма: {money(p['amount'])} USDT\n"
+            f"TXID: <code>{esc(p.get('tx_hash') or 'Не указан')}</code>"
         )
 
-        if not users:
-            bot.send_message(ADMIN_ID, "Покупателей пока нет.")
-            return
-
-        text = "👥 <b>Покупатели</b>\n\n"
-
-        for user in users:
-            text += (
-                f"{safe_text(user.get('first_name') or 'Без имени')}\n"
-                f"ID: <code>{user.get('user_id')}</code>\n"
-                f"Баланс: {money_text(user.get('balance', 0))} USDT\n"
-                f"Покупок: {user.get('purchased_count', 0)}\n\n"
-            )
-
-        bot.send_message(ADMIN_ID, text, parse_mode="HTML")
-
-    except Exception as error:
-        print("Ошибка покупателей:", error)
-        bot.send_message(ADMIN_ID, "Не удалось загрузить покупателей.")
-
-
-# ==================================================
-# СТАТИСТИКА
-# ==================================================
-
-@bot.callback_query_handler(func=lambda c: c.data == "admin_stats")
-def admin_stats(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "Нет доступа.")
-        return
-
-    bot.answer_callback_query(call.id)
-
-    try:
-        users = db.table("users").select("*").execute().data or []
-        orders = db.table("orders").select("*").execute().data or []
-
-        total = sum(
-            (
-                money(order.get("price", 0))
-                for order in orders
-                if order.get("status") != "Отклонён, средства возвращены"
+        markup = types.InlineKeyboardMarkup()
+        markup.row(
+            types.InlineKeyboardButton(
+                "✅ Одобрить",
+                callback_data=f"review_yes:{p['payment_ref']}"
             ),
-            Decimal("0.00")
+            types.InlineKeyboardButton(
+                "❌ Отклонить",
+                callback_data=f"review_no:{p['payment_ref']}"
+            )
         )
 
-        total_balance = sum(
-            (money(user.get("balance", 0)) for user in users),
-            Decimal("0.00")
-        )
-
-        bot.send_message(
-            ADMIN_ID,
-            "📊 <b>Статистика магазина</b>\n\n"
-            f"Покупателей: {len(users)}\n"
-            f"Заказов: {len(orders)}\n"
-            f"Сумма заказов без возвратов: {total:.2f} USDT\n"
-            f"Баланс покупателей: {total_balance:.2f} USDT",
-            parse_mode="HTML"
-        )
-
-    except Exception as error:
-        print("Ошибка статистики:", error)
-        bot.send_message(ADMIN_ID, "Не удалось загрузить статистику.")
+        bot.send_message(call.message.chat.id, text, reply_markup=markup)
 
 
-# ==================================================
-# ПРОЧИЕ СООБЩЕНИЯ
-# ==================================================
+# =========================================================
+# ОТМЕНА ДЕЙСТВИЙ
+# =========================================================
 
-@bot.message_handler(func=lambda m: True, content_types=["text"])
-def other_messages(message):
+@bot.message_handler(commands=["menu"])
+def menu_command(message):
+    clear_state(message.from_user.id)
     bot.send_message(
         message.chat.id,
-        "Выбери действие в меню.",
+        "Главное меню:",
         reply_markup=main_menu(message.from_user.id)
     )
 
 
-# ==================================================
+# =========================================================
+# ОБРАБОТКА НЕИЗВЕСТНЫХ СООБЩЕНИЙ
+# =========================================================
+
+@bot.message_handler(content_types=["text"])
+def unknown_message(message):
+    if message.text and message.text.startswith("/"):
+        return
+
+    if states.get(message.from_user.id):
+        return
+
+    bot.send_message(
+        message.chat.id,
+        "Выберите действие в меню.",
+        reply_markup=main_menu(message.from_user.id)
+    )
+
+
+# =========================================================
 # ЗАПУСК
-# ==================================================
+# =========================================================
 
 if __name__ == "__main__":
-    print("Digital Shop запущен!")
-    print("Каталог, склад, автоматическая выдача и вторичный рынок подключены.")
+    logging.info("Бот запускается")
 
-    bot.infinity_polling(
-        skip_pending=True,
-        timeout=30,
-        long_polling_timeout=30
-    )
+    try:
+        bot.infinity_polling(
+            skip_pending=True,
+            timeout=20,
+            long_polling_timeout=20
+        )
+    except KeyboardInterrupt:
+        logging.info("Бот остановлен")
+    except Exception:
+        logging.exception("Критическая ошибка бота")
+        raise
