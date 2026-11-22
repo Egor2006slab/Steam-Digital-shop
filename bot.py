@@ -37,6 +37,10 @@ db = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 states = {}
 
+# Пользователи, которые запустили бота командой /start.
+# После перезапуска бота список очищается.
+started_users = set()
+
 
 # =========================================================
 # ОБЩИЕ ФУНКЦИИ
@@ -177,15 +181,63 @@ def format_date(value):
 
 
 # =========================================================
-# СТАРТ И ПРОФИЛЬ
+# СТАРТ И ПРОВЕРКА ДОСТУПА
 # =========================================================
 
 @bot.message_handler(commands=["start"])
 def start(message):
-    save_user(message.from_user)
+    user_id = message.from_user.id
+
+    started_users.add(user_id)
+    clear_state(user_id)
+
+    try:
+        save_user(message.from_user)
+    except Exception:
+        logging.exception("Не удалось сохранить пользователя")
+
     send_home(
         message.chat.id,
-        "Добро пожаловать в магазин цифровых товаров!"
+        "👋 Добро пожаловать в магазин цифровых товаров!"
+    )
+
+
+# Все текстовые сообщения до /start перехватываются здесь.
+# Обработчик зарегистрирован раньше обработчиков магазина.
+@bot.message_handler(
+    content_types=["text"],
+    func=lambda m: m.from_user.id not in started_users
+)
+def require_start(message):
+    bot.send_message(
+        message.chat.id,
+        "👋 Добро пожаловать!\n\n"
+        "Чтобы открыть наш магазин, отправьте команду /start."
+    )
+
+
+# Блокируем inline-кнопки, если пользователь ещё не запускал бота.
+@bot.callback_query_handler(
+    func=lambda c: c.from_user.id not in started_users
+)
+def require_start_callback(call):
+    bot.answer_callback_query(
+        call.id,
+        "Сначала запустите магазин командой /start.",
+        show_alert=True
+    )
+
+
+@bot.message_handler(commands=["help"])
+def help_command(message):
+    bot.send_message(
+        message.chat.id,
+        "<b>ℹ️ Помощь по магазину</b>\n\n"
+        "/start — открыть магазин\n"
+        "/menu — открыть главное меню\n"
+        "/help — показать эту справку\n"
+        "/cancel — отменить текущее действие\n\n"
+        "Для покупки выберите товар в каталоге и следуйте инструкциям."
     )
 
 
@@ -1926,11 +1978,21 @@ def admin_payments(call):
 
 @bot.message_handler(commands=["menu"])
 def menu_command(message):
-    clear_state(message.from_user.id)
+    user_id = message.from_user.id
+
+    if user_id not in started_users:
+        bot.send_message(
+            message.chat.id,
+            "Сначала запустите магазин командой /start."
+        )
+        return
+
+    clear_state(user_id)
+
     bot.send_message(
         message.chat.id,
         "Главное меню:",
-        reply_markup=main_menu(message.from_user.id)
+        reply_markup=main_menu(user_id)
     )
 
 
@@ -1939,12 +2001,20 @@ def unknown_message(message):
     if message.text and message.text.startswith("/"):
         return
 
+    if message.from_user.id not in started_users:
+        bot.send_message(
+            message.chat.id,
+            "👋 Добро пожаловать!\n\n"
+            "Чтобы открыть наш магазин, отправьте команду /start."
+        )
+        return
+
     if states.get(message.from_user.id):
         return
 
     bot.send_message(
         message.chat.id,
-        "Выберите действие в меню.",
+        "👋 Чтобы открыть раздел магазина, используйте кнопки меню.",
         reply_markup=main_menu(message.from_user.id)
     )
 
