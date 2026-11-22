@@ -89,7 +89,7 @@ def main_menu(user_id):
 
     markup.row("🛍 Каталог", "📦 Мои заказы")
     markup.row("💳 История платежей", "👤 Профиль")
-    markup.row("🆘 Поддержка")
+    markup.row("🆘 Поддержка", "🔄 Перепродажа")
 
     if is_admin(user_id):
         markup.row("⚙️ Админ-панель")
@@ -128,6 +128,39 @@ def get_payment(payment_ref):
     return first_row(result.data)
 
 
+def get_resale_listing(listing_id):
+    result = (
+        db.table("resale_listings")
+        .select("*")
+        .eq("id", listing_id)
+        .limit(1)
+        .execute()
+    )
+    return first_row(result.data)
+
+
+def get_resale_good(good_id):
+    result = (
+        db.table("resale_goods")
+        .select("*")
+        .eq("id", good_id)
+        .limit(1)
+        .execute()
+    )
+    return first_row(result.data)
+
+
+def get_listing_for_good(good_id):
+    result = (
+        db.table("resale_listings")
+        .select("*")
+        .eq("good_id", good_id)
+        .limit(1)
+        .execute()
+    )
+    return first_row(result.data)
+
+
 def payment_keyboard(payment_ref):
     markup = types.InlineKeyboardMarkup()
 
@@ -137,6 +170,16 @@ def payment_keyboard(payment_ref):
     ))
 
     return markup
+
+
+def format_date(value):
+    if not value:
+        return "Не указана"
+
+    try:
+        return str(value).replace("T", " ").split(".")[0]
+    except Exception:
+        return str(value)
 
 
 # =========================================================
@@ -211,11 +254,6 @@ def catalog(message):
             title,
             callback_data=f"product:{product['product_id']}"
         ))
-
-    markup.add(types.InlineKeyboardButton(
-        "🔄 Перепродажа",
-        callback_data="resale_catalog"
-    ))
 
     bot.send_message(
         message.chat.id,
@@ -319,11 +357,6 @@ def back_catalog(call):
             f"{product['name']} — {money(product['price'])} USDT",
             callback_data=f"product:{product['product_id']}"
         ))
-
-    markup.add(types.InlineKeyboardButton(
-        "🔄 Перепродажа",
-        callback_data="resale_catalog"
-    ))
 
     bot.send_message(
         call.message.chat.id,
@@ -809,197 +842,38 @@ def payment_history(message):
 
 
 # =========================================================
-# ПЕРЕПРОДАЖА: ПУБЛИЧНЫЙ КАТАЛОГ
+# ПЕРЕПРОДАЖА: ГЛАВНОЕ МЕНЮ
 # =========================================================
 
-@bot.callback_query_handler(func=lambda c: c.data == "resale_catalog")
-def resale_catalog(call):
-    bot.answer_callback_query(call.id)
-
-    listings_result = (
-        db.table("resale_listings")
-        .select("*")
-        .eq("status", "active")
-        .order("created_at", desc=True)
-        .limit(50)
-        .execute()
-    )
-
-    listings = listings_result.data or []
+@bot.message_handler(func=lambda m: m.text == "🔄 Перепродажа")
+def resale_menu(message):
+    save_user(message.from_user)
 
     markup = types.InlineKeyboardMarkup(row_width=1)
-    count = 0
 
-    for listing in listings:
-        good_result = (
-            db.table("resale_goods")
-            .select("product_id,seller_id,status")
-            .eq("id", listing["good_id"])
-            .limit(1)
-            .execute()
+    markup.add(
+        types.InlineKeyboardButton(
+            "➕ Создать закрытое объявление",
+            callback_data="resale_sell"
+        ),
+        types.InlineKeyboardButton(
+            "📋 Мои объявления",
+            callback_data="resale_my"
         )
-
-        good = first_row(good_result.data)
-
-        if not good or good["status"] != "listed":
-            continue
-
-        if int(good["seller_id"]) == call.from_user.id:
-            continue
-
-        product = get_product(good["product_id"])
-
-        if not product:
-            continue
-
-        markup.add(types.InlineKeyboardButton(
-            f"{product['name']} — "
-            f"{money(listing['asking_price'])} USDT",
-            callback_data=f"resale_view:{listing['id']}"
-        ))
-
-        count += 1
-
-    markup.add(types.InlineKeyboardButton(
-        "➕ Выставить свой товар",
-        callback_data="resale_sell"
-    ))
+    )
 
     bot.send_message(
-        call.message.chat.id,
-        f"<b>🔄 Перепродажа</b>\n\n"
-        f"Доступных объявлений: {count}\n\n"
-        "Для покупки свяжитесь непосредственно с продавцом.",
+        message.chat.id,
+        "<b>🔄 Перепродажа</b>\n\n"
+        "Здесь можно выставить на перепродажу товар, "
+        "который ранее был выдан вам в магазине.\n\n"
+        "Ваши объявления доступны только вам и администратору.",
         reply_markup=markup
     )
 
 
 # =========================================================
-# ПЕРЕПРОДАЖА: ПРОСМОТР ОБЪЯВЛЕНИЯ
-# =========================================================
-
-@bot.callback_query_handler(
-    func=lambda c: c.data.startswith("resale_view:")
-)
-def resale_view(call):
-    try:
-        listing_id = int(call.data.split(":", 1)[1])
-
-        listing_result = (
-            db.table("resale_listings")
-            .select("*")
-            .eq("id", listing_id)
-            .eq("status", "active")
-            .limit(1)
-            .execute()
-        )
-
-        listing = first_row(listing_result.data)
-
-        if not listing:
-            bot.answer_callback_query(
-                call.id,
-                "Объявление больше недоступно.",
-                show_alert=True
-            )
-            return
-
-        good_result = (
-            db.table("resale_goods")
-            .select("product_id,seller_id,status")
-            .eq("id", listing["good_id"])
-            .limit(1)
-            .execute()
-        )
-
-        good = first_row(good_result.data)
-
-        if not good or good["status"] != "listed":
-            bot.answer_callback_query(
-                call.id,
-                "Объявление больше недоступно.",
-                show_alert=True
-            )
-            return
-
-        if int(good["seller_id"]) == call.from_user.id:
-            bot.answer_callback_query(
-                call.id,
-                "Это ваше объявление.",
-                show_alert=True
-            )
-            return
-
-        product = get_product(good["product_id"])
-
-        if not product:
-            bot.answer_callback_query(
-                call.id,
-                "Товар не найден."
-            )
-            return
-
-        seller_id = int(good["seller_id"])
-
-        seller_result = (
-            db.table("users")
-            .select("username,first_name")
-            .eq("user_id", seller_id)
-            .limit(1)
-            .execute()
-        )
-
-        seller = first_row(seller_result.data) or {}
-        username = seller.get("username")
-
-        if username:
-            contact_url = (
-                f"https://t.me/{username.lstrip('@')}"
-            )
-        else:
-            contact_url = f"tg://user?id={seller_id}"
-
-        markup = types.InlineKeyboardMarkup()
-
-        markup.add(types.InlineKeyboardButton(
-            "✉️ Связаться с продавцом",
-            url=contact_url
-        ))
-
-        markup.add(types.InlineKeyboardButton(
-            "⬅️ К объявлениям",
-            callback_data="resale_catalog"
-        ))
-
-        text = (
-            "<b>🔄 Объявление</b>\n\n"
-            f"Товар: {esc(product['name'])}\n"
-            f"Категория: {esc(product.get('category'))}\n"
-            f"Цена: <b>{money(listing['asking_price'])} USDT</b>\n\n"
-            "Для покупки свяжитесь с продавцом напрямую.\n"
-            "Оплата и передача товара происходят между продавцом и покупателем."
-        )
-
-        bot.answer_callback_query(call.id)
-
-        bot.send_message(
-            call.message.chat.id,
-            text,
-            reply_markup=markup
-        )
-
-    except Exception:
-        logging.exception("Ошибка открытия объявления")
-
-        bot.answer_callback_query(
-            call.id,
-            "Не удалось открыть объявление.",
-            show_alert=True
-        )
-
-
-# =========================================================
-# ПЕРЕПРОДАЖА: ВЫСТАВИТЬ СВОЙ ТОВАР
+# ПЕРЕПРОДАЖА: СОЗДАНИЕ ОБЪЯВЛЕНИЯ
 # =========================================================
 
 @bot.callback_query_handler(func=lambda c: c.data == "resale_sell")
@@ -1007,54 +881,65 @@ def resale_sell_start(call):
     user_id = call.from_user.id
     save_user(call.from_user)
 
-    result = (
-        db.table("orders")
-        .select("order_id,product,status")
-        .eq("user_id", user_id)
-        .eq("status", "Выдан покупателю")
-        .order("created_at", desc=True)
-        .execute()
-    )
-
-    orders = result.data or []
-
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    count = 0
-
-    for order in orders:
-        existing = (
-            db.table("resale_goods")
-            .select("id")
-            .eq("original_order_id", order["order_id"])
-            .limit(1)
+    try:
+        result = (
+            db.table("orders")
+            .select("order_id,product,price,status,created_at")
+            .eq("user_id", user_id)
+            .eq("status", "Выдан покупателю")
+            .order("created_at", desc=True)
             .execute()
         )
 
-        if existing.data:
-            continue
+        orders = result.data or []
 
-        markup.add(types.InlineKeyboardButton(
-            f"{order.get('product')} — заказ {order['order_id']}",
-            callback_data=f"sell_order:{order['order_id']}"
-        ))
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        count = 0
 
-        count += 1
+        for order in orders:
+            existing = (
+                db.table("resale_goods")
+                .select("id")
+                .eq("original_order_id", order["order_id"])
+                .limit(1)
+                .execute()
+            )
 
-    bot.answer_callback_query(call.id)
+            if existing.data:
+                continue
 
-    if count == 0:
+            markup.add(types.InlineKeyboardButton(
+                f"{order.get('product')} — заказ {order['order_id']}",
+                callback_data=f"sell_order:{order['order_id']}"
+            ))
+
+            count += 1
+
+        bot.answer_callback_query(call.id)
+
+        if count == 0:
+            bot.send_message(
+                call.message.chat.id,
+                "У вас нет доступных заказов для перепродажи.\n\n"
+                "Можно выставить только товар, который был выдан вам ранее "
+                "и ещё не выставлялся на перепродажу."
+            )
+            return
+
         bot.send_message(
             call.message.chat.id,
-            "У вас нет доступных заказов для перепродажи.\n"
-            "Выставить можно только товар, который был выдан вам ранее."
+            "Выберите свой заказ, товар из которого хотите выставить:",
+            reply_markup=markup
         )
-        return
 
-    bot.send_message(
-        call.message.chat.id,
-        "Выберите заказ, товар из которого хотите выставить на перепродажу:",
-        reply_markup=markup
-    )
+    except Exception:
+        logging.exception("Ошибка получения заказов для перепродажи")
+
+        bot.answer_callback_query(
+            call.id,
+            "Не удалось загрузить заказы.",
+            show_alert=True
+        )
 
 
 @bot.callback_query_handler(
@@ -1062,6 +947,25 @@ def resale_sell_start(call):
 )
 def resale_set_price(call):
     order_id = call.data.split(":", 1)[1]
+
+    # Дополнительно проверяем, что заказ принадлежит пользователю.
+    order_result = (
+        db.table("orders")
+        .select("order_id")
+        .eq("order_id", order_id)
+        .eq("user_id", call.from_user.id)
+        .eq("status", "Выдан покупателю")
+        .limit(1)
+        .execute()
+    )
+
+    if not order_result.data:
+        bot.answer_callback_query(
+            call.id,
+            "Этот заказ недоступен.",
+            show_alert=True
+        )
+        return
 
     states[call.from_user.id] = {
         "action": "resale_price",
@@ -1072,7 +976,8 @@ def resale_set_price(call):
 
     bot.send_message(
         call.message.chat.id,
-        "Введите цену перепродажи в USDT (например, 25.50).\n"
+        "Введите желаемую цену перепродажи в USDT.\n\n"
+        "Например: <code>25.50</code>\n\n"
         "Для отмены отправьте /cancel."
     )
 
@@ -1106,32 +1011,101 @@ def receive_resale_price(message):
         )
         return
 
+    order_id = state.get("order_id")
+
     try:
+        # Проверяем заказ непосредственно перед созданием объявления.
+        order_result = (
+            db.table("orders")
+            .select("order_id")
+            .eq("order_id", order_id)
+            .eq("user_id", user_id)
+            .eq("status", "Выдан покупателю")
+            .limit(1)
+            .execute()
+        )
+
+        if not order_result.data:
+            clear_state(user_id)
+            bot.send_message(
+                message.chat.id,
+                "Заказ не найден или больше не доступен для перепродажи."
+            )
+            return
+
+        existing = (
+            db.table("resale_goods")
+            .select("id")
+            .eq("original_order_id", order_id)
+            .limit(1)
+            .execute()
+        )
+
+        if existing.data:
+            clear_state(user_id)
+            bot.send_message(
+                message.chat.id,
+                "Этот товар уже выставлялся на перепродажу."
+            )
+            return
+
         data = rpc("create_resale_listing", {
-            "p_order_id": state["order_id"],
+            "p_order_id": order_id,
             "p_seller_id": user_id,
             "p_price": float(price)
         })
 
         row = first_row(data)
 
-        clear_state(user_id)
-
         if not row:
+            clear_state(user_id)
             bot.send_message(
                 message.chat.id,
                 "Не удалось создать объявление. "
-                "Проверьте, разрешена ли перепродажа этого товара."
+                "Возможно, перепродажа этого товара запрещена."
+            )
+            return
+
+        clear_state(user_id)
+
+        # Получаем созданную запись, чтобы показать владельцу его объявление.
+        good_result = (
+            db.table("resale_goods")
+            .select("*")
+            .eq("original_order_id", order_id)
+            .eq("seller_id", user_id)
+            .limit(1)
+            .execute()
+        )
+
+        good = first_row(good_result.data)
+
+        if not good:
+            bot.send_message(
+                message.chat.id,
+                "Объявление создано, но не удалось загрузить его сведения. "
+                "Откройте раздел «Мои объявления»."
+            )
+            return
+
+        listing = get_listing_for_good(good["id"])
+
+        if not listing:
+            bot.send_message(
+                message.chat.id,
+                "Объявление создано, но не удалось загрузить его сведения. "
+                "Откройте раздел «Мои объявления»."
             )
             return
 
         bot.send_message(
             message.chat.id,
-            "<b>✅ Объявление создано</b>\n\n"
-            f"Товар: {esc(row.get('product_name'))}\n"
-            f"Цена: {money(row.get('asking_price', price))} USDT\n"
-            "Секретный код сохранён в системе."
+            "✅ <b>Закрытое объявление создано!</b>\n\n"
+            "Оно доступно только вам и администратору.\n"
+            "Секретный код в вашем объявлении не отображается."
         )
+
+        send_my_resale_detail(message.chat.id, user_id, listing["id"])
 
     except Exception:
         logging.exception("Ошибка создания объявления")
@@ -1142,6 +1116,182 @@ def receive_resale_price(message):
             message.chat.id,
             "Не удалось выставить товар. "
             "Возможно, он уже выставлен или перепродажа запрещена."
+        )
+
+
+# =========================================================
+# ПЕРЕПРОДАЖА: МОИ ОБЪЯВЛЕНИЯ
+# =========================================================
+
+@bot.callback_query_handler(func=lambda c: c.data == "resale_my")
+def resale_my_listings(call):
+    user_id = call.from_user.id
+
+    try:
+        goods_result = (
+            db.table("resale_goods")
+            .select("id,product_id,status,original_order_id")
+            .eq("seller_id", user_id)
+            .order("id", desc=True)
+            .limit(50)
+            .execute()
+        )
+
+        goods = goods_result.data or []
+
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        count = 0
+
+        for good in goods:
+            listing = get_listing_for_good(good["id"])
+
+            if not listing:
+                continue
+
+            product = get_product(good["product_id"])
+            product_name = (
+                product.get("name")
+                if product
+                else good.get("product_id")
+            )
+
+            status = (
+                "🟢 Активно"
+                if listing.get("status") == "active"
+                else "⚫ Продано"
+            )
+
+            markup.add(types.InlineKeyboardButton(
+                f"{status} | {product_name} | "
+                f"{money(listing.get('asking_price'))} USDT",
+                callback_data=f"myresale:{listing['id']}"
+            ))
+
+            count += 1
+
+        bot.answer_callback_query(call.id)
+
+        if count == 0:
+            bot.send_message(
+                call.message.chat.id,
+                "У вас пока нет объявлений.\n\n"
+                "Нажмите «Создать закрытое объявление», "
+                "чтобы выставить ранее купленный товар."
+            )
+            return
+
+        bot.send_message(
+            call.message.chat.id,
+            "<b>📋 Ваши закрытые объявления</b>\n\n"
+            "Выберите объявление, чтобы посмотреть подробности:",
+            reply_markup=markup
+        )
+
+    except Exception:
+        logging.exception("Ошибка загрузки собственных объявлений")
+
+        bot.answer_callback_query(
+            call.id,
+            "Не удалось загрузить объявления.",
+            show_alert=True
+        )
+
+
+def send_my_resale_detail(chat_id, user_id, listing_id):
+    listing = get_resale_listing(listing_id)
+
+    if not listing:
+        bot.send_message(chat_id, "Объявление не найдено.")
+        return
+
+    good = get_resale_good(listing["good_id"])
+
+    if not good or int(good["seller_id"]) != int(user_id):
+        bot.send_message(chat_id, "У вас нет доступа к этому объявлению.")
+        return
+
+    product = get_product(good["product_id"])
+
+    order_result = (
+        db.table("orders")
+        .select("*")
+        .eq("order_id", good["original_order_id"])
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+
+    order = first_row(order_result.data)
+
+    if not order:
+        bot.send_message(
+            chat_id,
+            "Не удалось загрузить сведения об исходном заказе."
+        )
+        return
+
+    product_name = (
+        product.get("name")
+        if product
+        else order.get("product") or good["product_id"]
+    )
+
+    category = product.get("category") if product else "Не указана"
+    description = product.get("description") if product else ""
+    transfer_status = product.get("transfer_status") if product else ""
+    verification_info = product.get("verification_info") if product else ""
+
+    listing_status = (
+        "🟢 Активно"
+        if listing.get("status") == "active"
+        else "⚫ Продано"
+    )
+
+    text = (
+        "<b>📋 Ваше закрытое объявление</b>\n\n"
+        f"<b>Товар:</b> {esc(product_name)}\n"
+        f"<b>ID товара:</b> <code>{esc(good.get('product_id'))}</code>\n"
+        f"<b>Категория:</b> {esc(category)}\n\n"
+        "<b>Информация о первоначальной покупке</b>\n"
+        f"Номер заказа: <code>{esc(order.get('order_id'))}</code>\n"
+        f"Цена покупки: {money(order.get('price'))} USDT\n"
+        f"Дата покупки: {esc(format_date(order.get('created_at')))}\n\n"
+        "<b>Описание товара</b>\n"
+        f"{esc(description or 'Не указано')}\n\n"
+        f"<b>Передача:</b> {esc(transfer_status or 'Не указана')}\n\n"
+        "<b>Дополнительные сведения</b>\n"
+        f"{esc(verification_info or 'Не указаны')}\n\n"
+        "<b>Ваше объявление</b>\n"
+        f"Цена перепродажи: <b>{money(listing.get('asking_price'))} USDT</b>\n"
+        f"Статус: {listing_status}\n\n"
+        "🔒 Секретный код скрыт."
+    )
+
+    bot.send_message(chat_id, text)
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("myresale:")
+)
+def my_resale_detail(call):
+    try:
+        listing_id = int(call.data.split(":", 1)[1])
+
+        bot.answer_callback_query(call.id)
+
+        send_my_resale_detail(
+            call.message.chat.id,
+            call.from_user.id,
+            listing_id
+        )
+
+    except Exception:
+        logging.exception("Ошибка просмотра собственного объявления")
+
+        bot.answer_callback_query(
+            call.id,
+            "Не удалось открыть объявление.",
+            show_alert=True
         )
 
 
@@ -1262,7 +1412,7 @@ def admin_panel(message):
             callback_data="admin_payments"
         ),
         types.InlineKeyboardButton(
-            "🔄 Объявления перепродажи",
+            "🔄 Все объявления перепродажи",
             callback_data="admin_resale"
         )
     )
@@ -1275,7 +1425,7 @@ def admin_panel(message):
 
 
 # =========================================================
-# АДМИН: ОБЪЯВЛЕНИЯ ПЕРЕПРОДАЖИ
+# АДМИН: ВСЕ ОБЪЯВЛЕНИЯ ПЕРЕПРОДАЖИ
 # =========================================================
 
 @bot.callback_query_handler(func=lambda c: c.data == "admin_resale")
@@ -1288,55 +1438,67 @@ def admin_resale(call):
         )
         return
 
-    result = (
-        db.table("resale_listings")
-        .select("*")
-        .eq("status", "active")
-        .order("created_at", desc=True)
-        .limit(50)
-        .execute()
-    )
-
-    listings = result.data or []
-
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    count = 0
-
-    for listing in listings:
-        good_result = (
-            db.table("resale_goods")
-            .select("product_id,status")
-            .eq("id", listing["good_id"])
-            .limit(1)
+    try:
+        result = (
+            db.table("resale_listings")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(100)
             .execute()
         )
 
-        good = first_row(good_result.data)
+        listings = result.data or []
 
-        if not good or good["status"] != "listed":
-            continue
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        count = 0
 
-        product = get_product(good["product_id"])
+        for listing in listings:
+            good = get_resale_good(listing["good_id"])
 
-        if not product:
-            continue
+            if not good:
+                continue
 
-        markup.add(types.InlineKeyboardButton(
-            f"{product['name']} — "
-            f"{money(listing['asking_price'])} USDT",
-            callback_data=f"admin_resale_item:{listing['id']}"
-        ))
+            product = get_product(good["product_id"])
 
-        count += 1
+            product_name = (
+                product.get("name")
+                if product
+                else good["product_id"]
+            )
 
-    bot.answer_callback_query(call.id)
+            status = (
+                "🟢"
+                if listing.get("status") == "active"
+                else "⚫"
+            )
 
-    bot.send_message(
-        call.message.chat.id,
-        f"<b>🔄 Управление объявлениями</b>\n\n"
-        f"Активных объявлений: {count}",
-        reply_markup=markup
-    )
+            markup.add(types.InlineKeyboardButton(
+                f"{status} {product_name} — "
+                f"{money(listing.get('asking_price'))} USDT",
+                callback_data=f"admin_resale_item:{listing['id']}"
+            ))
+
+            count += 1
+
+        bot.answer_callback_query(call.id)
+
+        bot.send_message(
+            call.message.chat.id,
+            f"<b>🔄 Все объявления перепродажи</b>\n\n"
+            f"Всего объявлений: {count}\n\n"
+            "🟢 — активно\n"
+            "⚫ — продано",
+            reply_markup=markup
+        )
+
+    except Exception:
+        logging.exception("Ошибка загрузки объявлений для администратора")
+
+        bot.answer_callback_query(
+            call.id,
+            "Не удалось загрузить объявления.",
+            show_alert=True
+        )
 
 
 @bot.callback_query_handler(
@@ -1354,15 +1516,7 @@ def admin_resale_item(call):
     try:
         listing_id = int(call.data.split(":", 1)[1])
 
-        listing_result = (
-            db.table("resale_listings")
-            .select("*")
-            .eq("id", listing_id)
-            .limit(1)
-            .execute()
-        )
-
-        listing = first_row(listing_result.data)
+        listing = get_resale_listing(listing_id)
 
         if not listing:
             bot.answer_callback_query(
@@ -1371,15 +1525,7 @@ def admin_resale_item(call):
             )
             return
 
-        good_result = (
-            db.table("resale_goods")
-            .select("*")
-            .eq("id", listing["good_id"])
-            .limit(1)
-            .execute()
-        )
-
-        good = first_row(good_result.data)
+        good = get_resale_good(listing["good_id"])
 
         if not good:
             bot.answer_callback_query(
@@ -1389,6 +1535,16 @@ def admin_resale_item(call):
             return
 
         product = get_product(good["product_id"])
+
+        order_result = (
+            db.table("orders")
+            .select("*")
+            .eq("order_id", good["original_order_id"])
+            .limit(1)
+            .execute()
+        )
+
+        order = first_row(order_result.data) or {}
 
         seller_result = (
             db.table("users")
@@ -1409,29 +1565,46 @@ def admin_resale_item(call):
         )
 
         product_name = (
-            product["name"]
+            product.get("name")
             if product
             else good["product_id"]
         )
 
+        category = product.get("category") if product else "Не указана"
+        description = product.get("description") if product else ""
+        transfer_status = product.get("transfer_status") if product else ""
+        verification_info = product.get("verification_info") if product else ""
+
         text = (
             "<b>📋 Информация об объявлении</b>\n\n"
-            f"Товар: {esc(product_name)}\n"
+            f"<b>Товар:</b> {esc(product_name)}\n"
+            f"ID товара: <code>{esc(good.get('product_id'))}</code>\n"
+            f"Категория: {esc(category)}\n\n"
+            "<b>Первоначальная покупка</b>\n"
+            f"Заказ: <code>{esc(order.get('order_id'))}</code>\n"
+            f"Цена покупки: {money(order.get('price'))} USDT\n"
+            f"Дата покупки: {esc(format_date(order.get('created_at')))}\n\n"
+            "<b>Описание</b>\n"
+            f"{esc(description or 'Не указано')}\n\n"
+            f"Передача: {esc(transfer_status or 'Не указана')}\n\n"
+            "<b>Дополнительные сведения</b>\n"
+            f"{esc(verification_info or 'Не указаны')}\n\n"
+            "<b>Объявление</b>\n"
             f"ID объявления: <code>{listing_id}</code>\n"
-            f"Цена: {money(listing['asking_price'])} USDT\n"
+            f"Цена перепродажи: <b>{money(listing.get('asking_price'))} USDT</b>\n"
             f"Продавец: {esc(seller_name)}\n"
             f"ID продавца: <code>{good['seller_id']}</code>\n"
-            f"Статус объявления: {esc(listing['status'])}\n"
-            f"Статус товара: {esc(good['status'])}\n\n"
-            f"Секретный код:\n"
-            f"<code>{esc(good['secret_code'])}</code>"
+            f"Статус объявления: {esc(listing.get('status'))}\n"
+            f"Статус товара: {esc(good.get('status'))}\n\n"
+            "<b>🔐 Секретный код (только администратор)</b>\n"
+            f"<code>{esc(good.get('secret_code'))}</code>"
         )
 
         markup = types.InlineKeyboardMarkup()
 
         if (
-            listing["status"] == "active"
-            and good["status"] == "listed"
+            listing.get("status") == "active"
+            and good.get("status") == "listed"
         ):
             markup.add(types.InlineKeyboardButton(
                 "✅ Отметить как проданный",
@@ -1439,7 +1612,7 @@ def admin_resale_item(call):
             ))
 
         markup.add(types.InlineKeyboardButton(
-            "⬅️ К объявлениям",
+            "⬅️ Ко всем объявлениям",
             callback_data="admin_resale"
         ))
 
@@ -1452,7 +1625,7 @@ def admin_resale_item(call):
         )
 
     except Exception:
-        logging.exception("Ошибка просмотра объявления")
+        logging.exception("Ошибка просмотра объявления администратором")
 
         bot.answer_callback_query(
             call.id,
@@ -1476,7 +1649,7 @@ def admin_resale_mark_sold(call):
     try:
         listing_id = int(call.data.split(":", 1)[1])
 
-        listing_result = (
+        listing = (
             db.table("resale_listings")
             .select("*")
             .eq("id", listing_id)
@@ -1485,12 +1658,30 @@ def admin_resale_mark_sold(call):
             .execute()
         )
 
-        listing = first_row(listing_result.data)
+        listing = first_row(listing.data)
 
         if not listing:
             bot.answer_callback_query(
                 call.id,
                 "Объявление уже обработано.",
+                show_alert=True
+            )
+            return
+
+        # Сначала проверяем, что товар ещё выставлен.
+        good = (
+            db.table("resale_goods")
+            .select("id,status")
+            .eq("id", listing["good_id"])
+            .eq("status", "listed")
+            .limit(1)
+            .execute()
+        )
+
+        if not good.data:
+            bot.answer_callback_query(
+                call.id,
+                "Товар уже изменён или продан.",
                 show_alert=True
             )
             return
@@ -1518,19 +1709,23 @@ def admin_resale_mark_sold(call):
 
         # Меняем статус товара.
         try:
-            db.table("resale_goods").update({
-                "status": "sold"
-            }).eq(
-                "id",
-                listing["good_id"]
-            ).eq(
-                "status",
-                "listed"
-            ).execute()
+            good_update = (
+                db.table("resale_goods")
+                .update({"status": "sold"})
+                .eq("id", listing["good_id"])
+                .eq("status", "listed")
+                .select("id")
+                .execute()
+            )
+
+            if not good_update.data:
+                raise RuntimeError(
+                    "Не удалось изменить статус товара."
+                )
 
         except Exception:
-            # Возвращаем объявление в активное состояние,
-            # если не получилось изменить товар.
+            # Если изменение товара не удалось,
+            # возвращаем объявление в активное состояние.
             db.table("resale_listings").update({
                 "status": "active",
                 "sold_at": None
@@ -1544,15 +1739,9 @@ def admin_resale_mark_sold(call):
         )
 
         bot.send_message(
-            ADMIN_ID,
-            "✅ <b>Объявление отмечено как проданное.</b>\n\n"
-            f"ID объявления: <code>{listing_id}</code>"
-        )
-
-        bot.send_message(
             call.message.chat.id,
-            "✅ Статус товара изменён на «Продан».\n"
-            "Объявление больше не показывается покупателям."
+            "✅ Объявление и товар отмечены как проданные.\n\n"
+            "Статус первоначального заказа не изменён."
         )
 
     except Exception:
