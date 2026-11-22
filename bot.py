@@ -6,7 +6,6 @@ from datetime import datetime, timezone, timedelta
 
 import telebot
 from telebot import types
-from telebot.apihelper import ApiTelegramException
 from supabase import create_client
 
 
@@ -107,7 +106,7 @@ def clear_screen(chat_id):
 
 def show_screen(chat_id, text, reply_markup=None, parse_mode="HTML"):
     """
-    Отправляет новый экран и удаляет предыдущие временные экраны.
+    Отправляет новый экран и удаляет предыдущий временный экран.
     Не используется для важных уведомлений и секретных кодов.
     """
     clear_screen(chat_id)
@@ -128,22 +127,22 @@ def edit_screen(call, text, reply_markup=None):
     Обновляет текущий экран по нажатию inline-кнопки.
     Если Telegram не позволяет редактирование, отправляет новый экран.
     """
+    chat_id = call.message.chat.id
+
     try:
         bot.edit_message_text(
             text,
-            call.message.chat.id,
+            chat_id,
             call.message.message_id,
             reply_markup=reply_markup,
             parse_mode="HTML"
         )
 
-        ui_messages[call.message.chat.id] = [
-            call.message.message_id
-        ]
+        ui_messages[chat_id] = [call.message.message_id]
 
     except Exception:
         show_screen(
-            call.message.chat.id,
+            chat_id,
             text,
             reply_markup=reply_markup
         )
@@ -190,10 +189,13 @@ def back_home_keyboard(back_callback=None):
 
 
 def send_home(chat_id, text="Главное меню"):
+    """
+    Главное меню тоже является временным экраном.
+    При переходе в другой раздел оно будет удалено.
+    """
     clear_state(chat_id)
-    clear_screen(chat_id)
 
-    bot.send_message(
+    show_screen(
         chat_id,
         text,
         reply_markup=main_menu(chat_id)
@@ -317,14 +319,7 @@ def show_catalog(chat_id):
 @bot.callback_query_handler(func=lambda c: c.data == "go_home")
 def callback_home(call):
     bot.answer_callback_query(call.id)
-    clear_state(call.from_user.id)
-    clear_screen(call.message.chat.id)
-
-    bot.send_message(
-        call.message.chat.id,
-        "Главное меню:",
-        reply_markup=main_menu(call.from_user.id)
-    )
+    send_home(call.message.chat.id, "Главное меню:")
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "cancel_action")
@@ -332,8 +327,8 @@ def callback_cancel_action(call):
     bot.answer_callback_query(call.id, "Действие отменено.")
     clear_state(call.from_user.id)
 
-    show_screen(
-        call.message.chat.id,
+    edit_screen(
+        call,
         "Действие отменено.",
         reply_markup=back_home_keyboard()
     )
@@ -349,6 +344,7 @@ def start(message):
 
     started_users.add(user_id)
     clear_state(user_id)
+    delete_user_message(message)
 
     try:
         save_user(message.from_user)
@@ -386,6 +382,8 @@ def require_start_callback(call):
 
 @bot.message_handler(commands=["help"])
 def help_command(message):
+    delete_user_message(message)
+
     show_screen(
         message.chat.id,
         "<b>ℹ️ Помощь по магазину</b>\n\n"
@@ -412,6 +410,7 @@ def cancel(message):
 
 @bot.message_handler(func=lambda m: m.text == "👤 Профиль")
 def profile(message):
+    delete_user_message(message)
     save_user(message.from_user)
 
     user = message.from_user
@@ -438,6 +437,7 @@ def profile(message):
 
 @bot.message_handler(func=lambda m: m.text == "🛍 Каталог")
 def catalog(message):
+    delete_user_message(message)
     save_user(message.from_user)
     show_catalog(message.chat.id)
 
@@ -537,8 +537,8 @@ def buy_product(call):
 
         bot.answer_callback_query(call.id, "Заказ создан.")
 
-        # Это важное сообщение с реквизитами оплаты.
-        # Оно не удаляется при переходе между экранами.
+        # Реквизиты оплаты — важное сообщение.
+        # Оно не записывается в список временных экранов.
         clear_screen(call.message.chat.id)
 
         bot.send_message(
@@ -668,7 +668,7 @@ def submit_payment_report(user_id, payment_ref, tx_hash):
 
     clear_state(user_id)
 
-    # Уведомление о принятии сообщения — важное, не временный экран.
+    # Подтверждение отправки — важное сообщение.
     clear_screen(user_id)
 
     bot.send_message(
@@ -887,6 +887,10 @@ def review_payment(call):
 def my_orders(message):
     user_id = message.from_user.id
 
+    # Удаляем нажатую пользователем кнопку-сообщение,
+    # если Telegram разрешает её удаление.
+    delete_user_message(message)
+
     result = (
         db.table("orders")
         .select("order_id,product,price,status,created_at")
@@ -929,6 +933,8 @@ def my_orders(message):
 
 @bot.message_handler(func=lambda m: m.text == "💳 История платежей")
 def payment_history(message):
+    delete_user_message(message)
+
     result = (
         db.table("crypto_payments")
         .select("payment_ref,payment_type,amount,status,created_at")
@@ -968,6 +974,7 @@ def payment_history(message):
 
 @bot.message_handler(func=lambda m: m.text == "🔄 Перепродажа")
 def resale_menu(message):
+    delete_user_message(message)
     save_user(message.from_user)
 
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -1045,12 +1052,12 @@ def resale_sell_start(call):
         bot.answer_callback_query(call.id)
 
         if count == 0:
-            show_screen(
-                call.message.chat.id,
+            edit_screen(
+                call,
                 "У вас нет доступных заказов для перепродажи.\n\n"
                 "Можно выставить только товар, который был выдан вам ранее "
                 "и ещё не выставлялся на перепродажу.",
-                reply_markup=back_home_keyboard("resale_back")
+                back_home_keyboard("resale_back")
             )
             return
 
@@ -1450,6 +1457,8 @@ def my_resale_detail(call):
 
 @bot.message_handler(func=lambda m: m.text == "🆘 Поддержка")
 def support_start(message):
+    delete_user_message(message)
+
     states[message.from_user.id] = {"action": "support"}
 
     show_screen(
@@ -1494,7 +1503,7 @@ def support_message(message):
 
         clear_state(user_id)
 
-        # Это подтверждение пользователю не удаляется очисткой экранов.
+        # Подтверждение пользователю — важное сообщение.
         clear_screen(user_id)
 
         bot.send_message(
@@ -1527,7 +1536,7 @@ def support_reply(message):
         user_id = int(parts[1])
         answer = parts[2]
 
-        # Ответ поддержки — важное сообщение, не временный экран.
+        # Ответ поддержки — важное сообщение.
         bot.send_message(
             user_id,
             "💬 <b>Ответ поддержки</b>\n\n" + esc(answer),
@@ -1546,6 +1555,8 @@ def support_reply(message):
 
 @bot.message_handler(func=lambda m: m.text == "⚙️ Админ-панель")
 def admin_panel(message):
+    delete_user_message(message)
+
     if not is_admin(message.from_user.id):
         return
 
@@ -1985,8 +1996,8 @@ def admin_resale_mark_sold(call):
             "Объявление отмечено как проданное."
         )
 
-        show_screen(
-            call.message.chat.id,
+        edit_screen(
+            call,
             "✅ <b>Объявление и товар отмечены как проданные.</b>\n\n"
             "Статус первоначального заказа не изменён.\n\n"
             f"📩 {esc(seller_notification)}\n\n"
@@ -2309,7 +2320,7 @@ def admin_payments(call):
         )
         return
 
-    # Список платежей отправляется отдельными важными сообщениями,
+    # Список платежей отправляется отдельными сообщениями,
     # чтобы кнопки одобрения/отклонения оставались доступными.
     clear_screen(call.message.chat.id)
 
@@ -2340,7 +2351,7 @@ def admin_payments(call):
             reply_markup=markup
         )
 
-    bot.send_message(
+    show_screen(
         call.message.chat.id,
         "⬅️ Вернуться в админ-панель:",
         reply_markup=back_home_keyboard("admin_back")
@@ -2362,14 +2373,8 @@ def menu_command(message):
         )
         return
 
-    clear_state(user_id)
-    clear_screen(message.chat.id)
-
-    bot.send_message(
-        message.chat.id,
-        "Главное меню:",
-        reply_markup=main_menu(user_id)
-    )
+    delete_user_message(message)
+    send_home(message.chat.id, "Главное меню:")
 
 
 @bot.message_handler(content_types=["text"])
@@ -2387,6 +2392,8 @@ def unknown_message(message):
 
     if states.get(message.from_user.id):
         return
+
+    delete_user_message(message)
 
     show_screen(
         message.chat.id,
