@@ -40,14 +40,14 @@ db = create_client(SUPABASE_URL, SUPABASE_KEY)
 # СИНЯЯ КНОПКА TELEGRAM И КОМАНДЫ
 # =========================================================
 
-# Синяя кнопка возле поля ввода открывает список команд.
 bot.set_chat_menu_button(
     menu_button=types.MenuButtonCommands()
 )
 
-# Команды, которые будут отображаться в списке.
+# /start намеренно отсутствует в списке,
+# но сама команда продолжает работать.
+
 bot.set_my_commands([
-    types.BotCommand("start", "Запустить магазин"),
     types.BotCommand("menu", "Главное меню"),
     types.BotCommand("help", "Помощь"),
     types.BotCommand("cancel", "Отменить действие")
@@ -61,7 +61,7 @@ bot.set_my_commands([
 states = {}
 started_users = set()
 
-# Храним ID только основного экрана интерфейса.
+# ID основного экрана интерфейса.
 ui_messages = {}
 
 
@@ -249,8 +249,6 @@ def send_home(chat_id, text="Главное меню", new_message=False):
 
         ui_messages[chat_id] = sent.message_id
 
-        # Удаляем только старый экран интерфейса.
-        # Реквизиты, коды и другие важные сообщения не затрагиваются.
         if old_id and old_id != sent.message_id:
             safe_delete(chat_id, old_id)
 
@@ -462,6 +460,23 @@ def menu_admin_callback(call):
 @bot.message_handler(commands=["start"])
 def start(message):
     user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    # Проверяем, есть ли пользователь в базе.
+    try:
+        existing_user = (
+            db.table("users")
+            .select("user_id")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+
+        first_start = not bool(existing_user.data)
+
+    except Exception:
+        logging.exception("Ошибка проверки пользователя")
+        first_start = False
 
     started_users.add(user_id)
     clear_state(user_id)
@@ -472,10 +487,15 @@ def start(message):
     except Exception:
         logging.exception("Не удалось сохранить пользователя")
 
+    if first_start:
+        text = "👋 Добро пожаловать в магазин цифровых товаров!"
+    else:
+        text = "Главное меню:"
+
     send_home(
-        message.chat.id,
-        "👋 Добро пожаловать в магазин цифровых товаров!",
-        new_message=True
+        chat_id,
+        text,
+        new_message=False
     )
 
 
@@ -673,11 +693,11 @@ def buy_product(call):
             reply_markup=payment_keyboard(payment_ref)
         )
 
-        # Новое главное меню появляется после реквизитов.
+        # Главное меню обновляется без создания дубликата.
         send_home(
             call.message.chat.id,
             "🏠 Главное меню",
-            new_message=True
+            new_message=False
         )
 
     except Exception:
@@ -922,11 +942,11 @@ def notify_payment_result(payment, approved, secret_code=None):
             "Если вы считаете, что произошла ошибка, обратитесь в поддержку."
         )
 
-    # После результата покупки отправляем новое главное меню.
+    # Обновляем основное меню без создания дубликата.
     send_home(
         user_id,
         "🏠 Главное меню",
-        new_message=True
+        new_message=False
     )
 
 
